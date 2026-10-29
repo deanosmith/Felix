@@ -18,9 +18,10 @@ fi
 swift build --package-path "$project_root" --configuration "$configuration"
 binary_directory="$(swift build --package-path "$project_root" --configuration "$configuration" --show-bin-path)"
 
-mkdir -p "$app_path/Contents/MacOS"
+mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 install -m 755 "$binary_directory/Orth" "$app_path/Contents/MacOS/Orth"
 install -m 644 "$project_root/Resources/Info.plist" "$app_path/Contents/Info.plist"
+install -m 644 "$project_root/Resources/AppIcon.icns" "$app_path/Contents/Resources/AppIcon.icns"
 /usr/bin/codesign --force --sign "${ORTH_SIGNING_IDENTITY:-${MAC_AUTOCORRECT_SIGNING_IDENTITY:--}}" \
     --identifier local.deanmsmith.MacAutocorrect "$app_path"
 

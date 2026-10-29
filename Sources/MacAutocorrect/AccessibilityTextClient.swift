@@ -17,10 +17,12 @@ struct TextSnapshot {
 @MainActor
 final class AccessibilityTextClient {
     private let systemWide = AXUIElementCreateSystemWide()
+    private let applicationFilter: ApplicationFilter
     private var preparedProcessID: pid_t?
     private(set) var failureReason: String?
 
-    init() {
+    init(applicationFilter: ApplicationFilter) {
+        self.applicationFilter = applicationFilter
         AXUIElementSetMessagingTimeout(systemWide, 0.04)
     }
 
@@ -39,25 +41,26 @@ final class AccessibilityTextClient {
             "com.microsoft.rdc.mac", "com.microsoft.windowsapp", "com.realvnc.vncviewer"
         ]
         let prefixes = [
-            "com.microsoft.vscode", "com.jetbrains.", "com.agilebits.",
+            "com.jetbrains.", "com.agilebits.",
             "com.1password.", "com.cursor.", "com.parallels.", "com.citrix."
         ]
-        return !excluded.contains(identifier) && !prefixes.contains(where: identifier.hasPrefix)
+        return applicationFilter.allows(identifier)
+            && !excluded.contains(identifier) && !prefixes.contains(where: identifier.hasPrefix)
     }
 
     func snapshot(expectedPID: pid_t) -> TextSnapshot? {
-          failureReason = "Focused app is unavailable or protected"
+        failureReason = "Focused app is unavailable or protected"
         guard let application = NSWorkspace.shared.frontmostApplication,
               application.processIdentifier == expectedPID, allows(application)
-          else { return nil }
-          prepare(application)
+        else { return nil }
+        prepare(application)
 
-          failureReason = "Focused text field is unavailable"
-          guard let element = focusedElement(expectedPID: expectedPID) else { return nil }
-          failureReason = "Focused field is protected or unsupported"
-          guard isSafe(element) else { return nil }
-          failureReason = "Focused field does not expose an editable caret"
-          guard
+        failureReason = "Focused text field is unavailable"
+        guard let element = focusedElement(expectedPID: expectedPID) else { return nil }
+        failureReason = "Focused field is protected or unsupported"
+        guard isSafe(element, in: application) else { return nil }
+        failureReason = "Focused field does not expose an editable caret"
+        guard
               isSettable(kAXSelectedTextRangeAttribute, on: element),
               let selection = selectedRange(of: element),
               selection.location >= 0, selection.length == 0
@@ -69,12 +72,15 @@ final class AccessibilityTextClient {
 
         let start = max(0, selection.location - 1_024)
         let length = selection.location - start + min(128, characterCount - selection.location)
-          failureReason = "Focused field does not expose readable text"
-        guard let text = string(in: NSRange(location: start, length: length), of: element),
-              (text as NSString).length == length
+        let contextRange = NSRange(location: start, length: length)
+        let prefixRange = NSRange(location: start, length: selection.location - start)
+        failureReason = "Focused field does not expose readable text"
+        // Chromium can report a character count larger than its addressable text.
+        guard let text = string(in: contextRange, of: element)
+            ?? string(in: prefixRange, of: element)
         else { return nil }
 
-          failureReason = nil
+        failureReason = nil
         return TextSnapshot(
             element: element,
             processID: expectedPID,
@@ -89,7 +95,7 @@ final class AccessibilityTextClient {
         original: String,
         replacement: String,
         in expected: TextSnapshot
-    ) -> TextSnapshot? {
+    ) -> (snapshot: TextSnapshot, bounds: CGRect?)? {
         guard let current = snapshot(expectedPID: expected.processID) else { return nil }
         failureReason = "Text or focus changed before correction"
         guard
@@ -111,7 +117,9 @@ final class AccessibilityTextClient {
               })
         else { return nil }
 
-        let application = NSRunningApplication(processIdentifier: expected.processID)
+        failureReason = "Focused app is unavailable"
+        guard let application = NSRunningApplication(processIdentifier: expected.processID)
+        else { return nil }
         let usesAccessibilityWrite = !isChromium(application)
             && isSettable(kAXSelectedTextAttribute, on: current.element)
         failureReason = "Keyboard insertion permission needed"
@@ -133,7 +141,7 @@ final class AccessibilityTextClient {
         }
 
         guard let focused = focusedElement(expectedPID: expected.processID),
-              CFEqual(focused, current.element), isSafe(focused),
+              CFEqual(focused, current.element), isSafe(focused, in: application),
               selectedRange(of: focused) == editRange,
               string(in: editRange, of: focused) == selectedText
         else {
@@ -169,22 +177,65 @@ final class AccessibilityTextClient {
             return nil
         }
 
-        return updated
+        let replacementRange = NSRange(location: range.location, length: replacementLength)
+        return (
+            snapshot: updated,
+            bounds: bounds(of: replacementRange, in: updated)
+        )
     }
 
-    func bounds(of range: NSRange, in snapshot: TextSnapshot) -> CGRect? {
+    private func bounds(of range: NSRange, in snapshot: TextSnapshot) -> CGRect? {
         guard let focused = focusedElement(expectedPID: snapshot.processID),
               CFEqual(focused, snapshot.element)
         else { return nil }
         var requested = CFRange(location: range.location, length: range.length)
         guard let rangeValue = AXValueCreate(.cfRange, &requested) else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-            focused, kAXBoundsForRangeParameterizedAttribute as CFString, rangeValue, &value
-        ) == .success, let value, CFGetTypeID(value) == AXValueGetTypeID()
+        if let rectangle = bounds(
+            for: kAXBoundsForRangeParameterizedAttribute, value: rangeValue, of: focused
+        ) {
+            return rectangle
+        }
+
+        // Chromium can expose text-marker geometry even when numeric bounds are empty.
+        let suffixLength = snapshot.selection.location - NSMaxRange(range)
+        guard range.length > 0, (0...4).contains(suffixLength),
+              selectedRange(of: focused) == snapshot.selection,
+              let selectedMarkers = attribute("AXSelectedTextMarkerRange", of: focused),
+              CFGetTypeID(selectedMarkers) == AXTextMarkerRangeGetTypeID(),
+              let expectedText = string(in: range, of: focused)
+        else { return nil }
+        let caretMarker = AXTextMarkerRangeCopyEndMarker(selectedMarkers as! AXTextMarkerRange)
+        guard let end = marker(before: caretMarker, count: suffixLength, of: focused),
+              let start = marker(before: end, count: range.length, of: focused)
+        else { return nil }
+        let markers = AXTextMarkerRangeCreate(nil, start, end)
+        guard (parameterizedAttribute(
+            "AXStringForTextMarkerRange", value: markers, of: focused
+        ) as? String) == expectedText
+        else { return nil }
+        return bounds(for: "AXBoundsForTextMarkerRange", value: markers, of: focused)
+    }
+
+    private func marker(before marker: AXTextMarker, count: Int, of element: AXUIElement) -> AXTextMarker? {
+        var current = marker
+        for _ in 0..<count {
+            guard let previous = parameterizedAttribute(
+                "AXPreviousTextMarkerForTextMarker", value: current, of: element
+            ), CFGetTypeID(previous) == AXTextMarkerGetTypeID()
+            else { return nil }
+            current = previous as! AXTextMarker
+        }
+        return current
+    }
+
+    private func bounds(
+        for parameter: String, value: CFTypeRef, of element: AXUIElement
+    ) -> CGRect? {
+        guard let result = parameterizedAttribute(parameter, value: value, of: element),
+              CFGetTypeID(result) == AXValueGetTypeID()
         else { return nil }
         var rectangle = CGRect.zero
-        guard AXValueGetValue(value as! AXValue, .cgRect, &rectangle),
+        guard AXValueGetValue(result as! AXValue, .cgRect, &rectangle),
               !rectangle.isNull, !rectangle.isInfinite, !rectangle.isEmpty
         else { return nil }
         return rectangle
@@ -204,7 +255,8 @@ final class AccessibilityTextClient {
         let identifier = application?.bundleIdentifier?.lowercased() ?? ""
         return [
             "com.google.chrome", "com.microsoft.edgemac", "com.brave.browser",
-            "company.thebrowser.browser", "com.operasoftware.opera", "com.vivaldi.vivaldi"
+            "company.thebrowser.browser", "com.operasoftware.opera", "com.vivaldi.vivaldi",
+            "com.microsoft.vscode", "com.deanmsmith.notas.electron"
         ].contains(where: identifier.hasPrefix)
     }
 
@@ -241,8 +293,13 @@ final class AccessibilityTextClient {
 
     private func focusedElement(expectedPID: pid_t) -> AXUIElement? {
         guard !IsSecureEventInputEnabled(), AXIsProcessTrusted(),
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
-              let value = attribute(kAXFocusedUIElementAttribute, of: systemWide),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID
+        else { return nil }
+
+        let application = AXUIElementCreateApplication(expectedPID)
+        AXUIElementSetMessagingTimeout(application, 0.04)
+        guard let value = attribute(kAXFocusedUIElementAttribute, of: application)
+            ?? attribute(kAXFocusedUIElementAttribute, of: systemWide),
               CFGetTypeID(value) == AXUIElementGetTypeID()
         else { return nil }
 
@@ -254,12 +311,14 @@ final class AccessibilityTextClient {
         return element
     }
 
-    private func isSafe(_ element: AXUIElement) -> Bool {
+    private func isSafe(_ element: AXUIElement, in application: NSRunningApplication) -> Bool {
+        let isVSCode = application.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.vscode") == true
+        let isChat = isVSCode && isChatInput(element)
         guard let role = attribute(kAXRoleAttribute, of: element) as? String,
               [kAXTextFieldRole, kAXTextAreaRole].contains(role),
               (attribute(kAXEnabledAttribute, of: element) as? Bool) != false,
               (attribute("AXProtectedContent", of: element) as? Bool) != true,
-              !hasTechnicalDocument(element)
+              (!isVSCode || isChat), (isChat || !hasTechnicalDocument(element))
         else { return false }
 
         let subrole = (attribute(kAXSubroleAttribute, of: element) as? String ?? "").lowercased()
@@ -273,12 +332,29 @@ final class AccessibilityTextClient {
         let classes = attribute("AXDOMClassList", of: element) as? [String] ?? []
         let hints = (descriptions + classes).map { String($0.prefix(512)) }
             .joined(separator: " ").lowercased()
-        return ![
+        guard ![
             "password", "passwd", "passphrase", "one-time", "verification code",
             "credit card", "card number", "security code", "api key", "secret key",
             "address bar", "url", "omnibox", "file name", "filename", "save as",
-            "file path", "code editor", "source editor", "monaco", "codemirror", "ace_editor"
+            "file path"
         ].contains(where: hints.contains)
+        else { return false }
+        return isChat || ![
+            "code editor", "source editor", "monaco", "codemirror", "ace_editor"
+        ].contains(where: hints.contains)
+    }
+
+    private func isChatInput(_ element: AXUIElement) -> Bool {
+        var current = element
+        for _ in 0..<8 {
+            let classes = attribute("AXDOMClassList", of: current) as? [String] ?? []
+            if classes.contains("chat-input-container") { return true }
+            guard let parent = attribute(kAXParentAttribute, of: current),
+                  CFGetTypeID(parent) == AXUIElementGetTypeID()
+            else { return false }
+            current = parent as! AXUIElement
+        }
+        return false
     }
 
     private func hasTechnicalDocument(_ element: AXUIElement) -> Bool {
@@ -303,6 +379,15 @@ final class AccessibilityTextClient {
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success
         else { return nil }
         return value
+    }
+
+    private func parameterizedAttribute(_ name: String, value: CFTypeRef, of element: AXUIElement) -> CFTypeRef? {
+        var result: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, name as CFString, value, &result
+        ) == .success
+        else { return nil }
+        return result
     }
 
     private func isSettable(_ name: String, on element: AXUIElement) -> Bool {
@@ -333,11 +418,21 @@ final class AccessibilityTextClient {
         var requested = CFRange(location: range.location, length: range.length)
         guard let rangeValue = AXValueCreate(.cfRange, &requested) else { return nil }
         var value: CFTypeRef?
-        if AXUIElementCopyParameterizedAttributeValue(
+        let result = AXUIElementCopyParameterizedAttributeValue(
             element, kAXStringForRangeParameterizedAttribute as CFString, rangeValue, &value
-        ) == .success, let text = value as? String { return text }
+        )
+        if [.parameterizedAttributeUnsupported, .attributeUnsupported, .notImplemented].contains(result) {
+            return valueString(in: range, of: element)
+        }
+        guard result == .success,
+              let text = value as? String, (text as NSString).length == range.length
+        else { return nil }
+        return text
+    }
 
-        guard let count = attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber,
+    private func valueString(in range: NSRange, of element: AXUIElement) -> String? {
+        guard range.location >= 0, range.length >= 0,
+              let count = attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber,
               (0...16_384).contains(count.intValue),
               let text = attribute(kAXValueAttribute, of: element) as? String
         else { return nil }

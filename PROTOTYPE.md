@@ -4,43 +4,109 @@
 
 1. Open `dist/Orth.app`.
 2. Grant the app access in System Settings > Privacy & Security > Accessibility.
-3. If its menu reports keyboard access unavailable, use Input Monitoring Settings
-   in the app menu to grant access. macOS may require quitting and reopening it.
+3. If Settings reports keyboard access unavailable, use Settings > Input Monitoring
+   Settings to grant access. macOS may require quitting and reopening it.
 4. In a supported prose field, type a lowercase typo such as `mispell`, then a space.
-5. Press Backspace immediately to revert a correction. Immediate Command-Z and
-   Undo Last Correction in the menu also revert it when the text is unchanged.
+5. Press Backspace or Command-Z immediately to revert a correction when the text
+   is unchanged.
 
-The app runs in the menu bar, not the Dock. Its menu includes a correction count,
-pause/resume, and Ignore Last Corrected Word. Ignoring a word saves it locally
-and attempts to revert that correction if the text is still unchanged.
+The app runs behind a wrench icon in the menu bar, not the Dock. Its menu includes
+Pause, Sensitivity, Apps, Glow Colour..., Ignore Last Word, Settings, and Quit.
+Pause changes to Resume while paused. Settings contains status, the correction
+count, recent activity, Check Focused Field, Accessibility Settings, and Input
+Monitoring Settings. Ignore Last Word
+applies to the last corrected word; undo remains available through the keyboard.
+The wrench is filled while unpaused and outlined and dimmed while paused.
+A green wrench app icon also identifies Orth in
+Finder and macOS privacy settings. Ignoring a word saves it locally and attempts
+to revert that correction if the text is still unchanged.
 
 Corrections replace text automatically after a space, including non-breaking
 spaces used by web editors. There is no suggestion popup. A final word without
 a following space is not corrected yet.
 
-After the editor confirms a replacement, a gentle green flash marks the corrected
-word and fades within about 300 ms. It never selects text, takes keyboard focus,
-or intercepts clicks. When word bounds are unavailable, the menu-bar icon briefly
-flashes instead. No feedback is shown for an unconfirmed replacement.
+After the editor confirms a replacement, a soft underline glows beneath only the
+corrected word's characters, excluding trailing spaces and punctuation. It is
+white by default; Glow Colour... opens the macOS colour picker to choose another
+colour, saved locally across restarts and used for subsequent corrections.
+It fades in, gently pulses, and fades out over 1.6 seconds rather
+than appearing abruptly. With Reduce Motion enabled, it stays steady for 1.6
+seconds instead. It never selects text, takes keyboard focus, or intercepts
+clicks. The menu-bar icon also
+shows a green checkmark while correction feedback is active, including when word
+bounds are unavailable. Each correction has its own glow and expiry time:
+overlapping glows coexist, and new corrections do not restart or hide earlier
+ones. No feedback is shown for an unconfirmed replacement.
+
+Chromium editors can return empty rectangles for numeric text ranges even when
+correction works. If numeric word bounds are unavailable, Orth derives an exact
+word-only text-marker range from the confirmed post-replacement caret and checks
+that its text matches the corrected word before requesting bounds. It never uses
+the replacement selection's bounds, which include the trailing separator.
+The glow does not create an extra selection or move the caret.
+If neither API provides geometry, the activity line and Console report that
+word bounds are unavailable; the menu-bar checkmark still confirms the edit.
+
+## Applications
+
+Use Apps in the menu bar to choose which apps Orth can correct:
+
+- All Apps Except Excluded is the default and preserves the original behavior
+  until you add exclusions.
+- Only Included Apps restricts corrections to apps checked in Included Apps.
+- Excluded Apps always takes priority, even if an app is also included.
+
+Included Apps and Excluded Apps show running apps alongside saved entries.
+Check an app to add it to that list; uncheck it to remove it. Add App... lets you
+select an installed app even when it is not running. Choices use bundle
+identifiers and are saved locally across restarts. Saved apps remain removable
+even if they are no longer installed.
+
+Changing the mode or either list cancels pending corrections and clears undo
+context. The menu reports App excluded - suspended when the focused app is not
+allowed. Inclusion never overrides protected-app, secure-input, sensitive-field,
+or technical-text safeguards.
 
 ## Browser Access and Diagnostics
 
-Chrome's web fields do not always advertise writable selected text. Orth enables
-Chromium's accessibility tree, selects only the completed word and its trailing
-separator, then reads the selection back before editing. Chromium editors use
-normal Unicode keyboard input rather than selected-text writes, which can be
-advertised without actually applying a web edit. Other editors use keyboard
-input when selected-text writes are unavailable. Events enter after Orth's own
-monitoring tap so its read-back wait cannot block them. Focus and selection are
-checked immediately before insertion, and the clipboard is never used.
+Chrome and Electron text fields do not always advertise usable selected-text
+writes. Orth enables the accessibility tree for supported browsers, Notas, and
+VS Code, selects only the completed word and its trailing separator, then reads
+the selection back before editing. These Chromium-based editors use normal
+Unicode keyboard input rather than selected-text writes, which can be advertised
+without actually applying an edit. Other editors use keyboard input when
+selected-text writes are unavailable. Events enter after Orth's own monitoring
+tap so its read-back wait cannot block them. Focus and selection are checked
+immediately before insertion, and the clipboard is never used.
+
+Focus is read from the active app first, with the system-wide focus as a fallback.
+Some Chromium fields report more characters than their ranged-text API can read,
+and their whole-field value can use different offsets. If the read extending past
+the caret fails, Orth reads only through the caret. Bounded whole-field values are
+used only when the ranged-text API is unsupported, not when a supported range read
+fails. This keeps the completed word and its separator aligned with the editor's
+selection ranges instead of incorrectly reporting a missing space.
+
+VS Code is supported only inside its chat input containers, identified through
+accessibility metadata. Its source editors, terminal, and other fields remain
+excluded. A chat input is not excluded just because the active editor tab is a
+source file or the composer uses Monaco internally. Sensitive fields and
+code-looking text remain protected, including inside chat.
+
+For VS Code's native EditContext chat input, set Editor: Accessibility Support
+to On (`"editor.accessibilitySupport": "on"` in VS Code settings). With this
+setting explicitly Off, VS Code can expose an empty accessibility buffer even
+while text is being entered. Orth does not bypass unreadable-field safeguards
+or change this preference automatically. Enabling it also turns on VS Code's
+screen-reader optimizations.
 
 Selection and insertion updates have short, bounded read-back waits. A rejected
 replacement restores the original caret when the selected text is unchanged,
 rather than leaving the typo selected. Secure fields and protected apps remain
 excluded.
 
-Focus the WhatsApp message composer, choose Check Focused Field from Orth's menu,
-then reopen the menu to read the result. The activity line also reports why the
+Focus the WhatsApp message composer, choose Settings > Check Focused Field from
+Orth's menu, then reopen Settings to read the result. The activity line also reports why the
 last attempted correction was skipped. This distinguishes permission problems
 from unsupported fields and an absence of spelling suggestions. Permission-state
 changes are logged to macOS Console without typed text or message contents.
@@ -112,17 +178,14 @@ be supplied with `ORTH_SIGNING_IDENTITY` for more stable attribution. The origin
   16,384 UTF-16 units. Typed text is not logged or sent to a cloud API. Undo context
   expires in 10 seconds.
 - Secure input, secure/search fields, password managers, known code editors,
-  terminals, remote desktop apps, and recognized source/config documents are skipped.
+  terminals, remote desktop apps, and recognized source/config documents are
+  skipped. VS Code's chat inputs are the exception to its app-wide editor block;
+  its source editors and terminal remain excluded.
 - Numbers and technical tokens such as URLs, emails, paths, and filenames with
   extensions are skipped. Code-looking lines and marked-text input methods are skipped.
 - Mixed-case and all-capital words are skipped to protect names and acronyms.
   Conservative and Balanced also skip initially capitalized words. Named-entity
   detection remains active, but names and extensionless filenames cannot always
-  be distinguished from typos. Ignore Last Corrected Word handles exceptions.
+  be distinguished from typos. Ignore handles exceptions.
 - Conservative checks deliberately miss some typos. App-specific text controls,
   existing native autocorrect, and rich-text editors need manual compatibility checks.
-
-## Version Two
-
-Add saved per-app enable/disable controls. Secure-field and sensitive-input
-protection must remain mandatory regardless of an app's enabled state.

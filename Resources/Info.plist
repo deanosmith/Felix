@@ -8,6 +8,8 @@
     <string>Orth</string>
     <key>CFBundleExecutable</key>
     <string>Orth</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>CFBundleIdentifier</key>
     <string>local.deanmsmith.MacAutocorrect</string>
     <key>CFBundleName</key>

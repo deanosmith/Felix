@@ -42,7 +42,8 @@ final class AutocorrectEngine: NSObject {
     private(set) var lastCorrection: CorrectionCandidate?
     private(set) var activity = "Waiting for a completed word"
 
-    private let client = AccessibilityTextClient()
+    let applicationFilter = ApplicationFilter()
+    private lazy var client = AccessibilityTextClient(applicationFilter: applicationFilter)
     private let policy = CorrectionPolicy()
     private let permissionLog = Logger(subsystem: "local.deanmsmith.MacAutocorrect", category: "Permissions")
     private let correctionLog = Logger(subsystem: "local.deanmsmith.MacAutocorrect", category: "Correction")
@@ -64,8 +65,11 @@ final class AutocorrectEngine: NSObject {
         if IsSecureEventInputEnabled() { return "Secure input active - suspended" }
         if tap == nil { return "Keyboard access unavailable" }
         if let tap, !CGEvent.tapIsEnabled(tap: tap) { return "Keyboard monitoring interrupted" }
-        if let application = NSWorkspace.shared.frontmostApplication, !client.allows(application) {
-            return "Protected app - suspended"
+        if let application = NSWorkspace.shared.frontmostApplication {
+            if !applicationFilter.allows(application.bundleIdentifier) {
+                return "App excluded - suspended"
+            }
+            if !client.allows(application) { return "Protected app - suspended" }
         }
         if !spellingIsReady { return "Preparing spelling engine" }
         return "Active"
@@ -132,6 +136,29 @@ final class AutocorrectEngine: NSObject {
         onChange?()
     }
 
+    func setApplicationFilterMode(_ mode: ApplicationFilterMode) {
+        guard applicationFilter.mode != mode else { return }
+        applicationFilter.setMode(mode)
+        applicationFilterChanged()
+    }
+
+    func setApplication(_ identifier: String, selected: Bool, in list: ApplicationFilterMode) {
+        guard applicationFilter.applications(in: list).contains(identifier.lowercased()) != selected
+        else { return }
+        applicationFilter.setApplication(identifier, selected: selected, in: list)
+        applicationFilterChanged()
+    }
+
+    private func applicationFilterChanged() {
+        revision &+= 1
+        pendingCorrection?.cancel()
+        pendingCorrection = nil
+        undoRecord = nil
+        activity = "Application settings updated"
+        correctionLog.notice("Application settings updated")
+        refreshAccess()
+    }
+
     func setMenuOpen(_ open: Bool) {
         menuIsOpen = open
         revision &+= 1
@@ -143,7 +170,7 @@ final class AutocorrectEngine: NSObject {
             return
         }
         guard let application = NSWorkspace.shared.frontmostApplication, client.allows(application) else {
-            setActivity("Focused app is protected or unavailable")
+            setActivity("Focused app is protected, excluded, or unavailable")
             return
         }
         if client.snapshot(expectedPID: application.processIdentifier) != nil {
@@ -214,7 +241,7 @@ final class AutocorrectEngine: NSObject {
             return false
         }
         guard let application = NSWorkspace.shared.frontmostApplication, client.allows(application) else {
-            setActivity("Focused app is protected or unavailable")
+            setActivity("Focused app is protected, excluded, or unavailable")
             return false
         }
 
@@ -291,7 +318,7 @@ final class AutocorrectEngine: NSObject {
             location: snapshot.contextStart + candidate.range.location, length: candidate.range.length
         )
         stage = "Replacing text"
-        guard let updated = client.replace(
+        guard let edit = client.replace(
             range: range, original: candidate.original,
             replacement: candidate.replacement, in: snapshot
         ) else {
@@ -301,17 +328,17 @@ final class AutocorrectEngine: NSObject {
 
         correctionCount += 1
         lastCorrection = candidate
-        activity = "Correction applied"
+        activity = edit.bounds == nil ? "Correction applied; word bounds unavailable" : "Correction applied"
         correctionLog.notice("Correction applied")
+        if edit.bounds == nil {
+            correctionLog.notice("Word glow unavailable: editor did not expose text bounds")
+        }
         undoRecord = UndoRecord(
-            snapshot: updated,
+            snapshot: edit.snapshot,
             range: NSRange(location: range.location, length: (candidate.replacement as NSString).length),
             original: candidate.original, replacement: candidate.replacement, created: Date()
         )
-        onCorrection?(client.bounds(
-            of: NSRange(location: range.location, length: (candidate.replacement as NSString).length),
-            in: updated
-        ))
+        onCorrection?(edit.bounds)
         onChange?()
     }
 
