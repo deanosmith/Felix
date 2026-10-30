@@ -29,8 +29,8 @@ After the editor confirms a replacement, a soft underline glows beneath only the
 corrected word's characters, excluding trailing spaces and punctuation. It is
 white by default; Glow Colour... opens the macOS colour picker to choose another
 colour, saved locally across restarts and used for subsequent corrections.
-It fades in, gently pulses, and fades out over 1.6 seconds rather
-than appearing abruptly. With Reduce Motion enabled, it stays steady for 1.6
+It appears at full brightness when the correction is confirmed, then smoothly
+fades out over 1.6 seconds. With Reduce Motion enabled, it stays steady for 1.6
 seconds instead. It never selects text, takes keyboard focus, or intercepts
 clicks. The menu-bar icon also
 shows a green checkmark while correction feedback is active, including when word

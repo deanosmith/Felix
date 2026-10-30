@@ -134,6 +134,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    private func wrenchImage(filled: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let wrench = NSBezierPath()
+            wrench.move(to: NSPoint(x: 3.4, y: 1))
+            wrench.curve(to: NSPoint(x: 1.2, y: 3.8),
+                         controlPoint1: NSPoint(x: 1.5, y: 1), controlPoint2: NSPoint(x: 1.2, y: 2.5))
+            wrench.curve(to: NSPoint(x: 2, y: 6),
+                         controlPoint1: NSPoint(x: 1.2, y: 4.7), controlPoint2: NSPoint(x: 1.6, y: 5.5))
+            wrench.line(to: NSPoint(x: 7.1, y: 10.1))
+            wrench.curve(to: NSPoint(x: 8, y: 12.8),
+                         controlPoint1: NSPoint(x: 7.9, y: 10.8), controlPoint2: NSPoint(x: 8, y: 11.3))
+            wrench.curve(to: NSPoint(x: 11.9, y: 17),
+                         controlPoint1: NSPoint(x: 8, y: 15.5), controlPoint2: NSPoint(x: 9.4, y: 17))
+            wrench.curve(to: NSPoint(x: 15.6, y: 15.4),
+                         controlPoint1: NSPoint(x: 13.6, y: 17), controlPoint2: NSPoint(x: 14.9, y: 16.9))
+            wrench.line(to: NSPoint(x: 12.6, y: 14.4))
+            wrench.curve(to: NSPoint(x: 12.1, y: 13.2),
+                         controlPoint1: NSPoint(x: 12.1, y: 14.2), controlPoint2: NSPoint(x: 11.9, y: 13.8))
+            wrench.line(to: NSPoint(x: 12.5, y: 11.8))
+            wrench.curve(to: NSPoint(x: 13.3, y: 11.3),
+                         controlPoint1: NSPoint(x: 12.6, y: 11.3), controlPoint2: NSPoint(x: 12.9, y: 11.2))
+            wrench.line(to: NSPoint(x: 16.1, y: 12.1))
+            wrench.curve(to: NSPoint(x: 12.1, y: 8.4),
+                         controlPoint1: NSPoint(x: 16, y: 9.9), controlPoint2: NSPoint(x: 14.5, y: 8.6))
+            wrench.line(to: NSPoint(x: 10.3, y: 8.2))
+            wrench.curve(to: NSPoint(x: 8.7, y: 7.1),
+                         controlPoint1: NSPoint(x: 9.7, y: 8.1), controlPoint2: NSPoint(x: 9.2, y: 7.7))
+            wrench.line(to: NSPoint(x: 5.5, y: 2.4))
+            wrench.curve(to: NSPoint(x: 3.4, y: 1),
+                         controlPoint1: NSPoint(x: 5, y: 1.5), controlPoint2: NSPoint(x: 4.4, y: 1))
+            wrench.close()
+            NSColor.black.setFill()
+            NSColor.black.setStroke()
+            if filled {
+                wrench.fill()
+            } else {
+                wrench.lineWidth = 1.2
+                wrench.lineJoinStyle = .round
+                wrench.stroke()
+            }
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Orth"
+        return image
+    }
+
     private func updateMenu() {
         status.title = engine.status
         counter.title = "Corrections this session: \(engine.correctionCount)"
@@ -147,11 +194,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             option.state = (option.representedObject as? String) == engine.applicationFilter.mode.rawValue ? .on : .off
         }
         ignore.isEnabled = engine.lastCorrection != nil
-        statusItem?.button?.image = NSImage(
-            systemSymbolName: showingCorrection ? "checkmark.circle.fill"
-                : (engine.isPaused ? "wrench" : "wrench.fill"),
-            accessibilityDescription: "Orth"
-        )
+        statusItem?.button?.image = showingCorrection
+            ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Orth")
+            : wrenchImage(filled: !engine.isPaused)
         statusItem?.button?.contentTintColor = showingCorrection ? .systemGreen
             : (engine.isPaused ? .secondaryLabelColor : nil)
         statusItem?.button?.toolTip = "Orth: \(engine.status) (\(engine.sensitivity.title))"
@@ -202,14 +247,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel.orderFrontRegardless()
             feedbackPanel = panel
             if !reduceMotion {
-                let glow = CAKeyframeAnimation(keyPath: "opacity")
-                glow.values = [0, 1, 0.65, 1, 0]
-                glow.keyTimes = [0, 0.12, 0.35, 0.55, 1]
+                let glow = CABasicAnimation(keyPath: "opacity")
+                glow.fromValue = 1
+                glow.toValue = 0
                 glow.duration = feedbackDuration
-                glow.calculationMode = .linear
-                glow.timingFunctions = Array(
-                    repeating: CAMediaTimingFunction(name: .easeInEaseOut), count: 4
-                )
+                glow.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 glow.fillMode = .both
                 glow.isRemovedOnCompletion = false
                 feedbackGlow.layer?.add(glow, forKey: "correctionGlow")

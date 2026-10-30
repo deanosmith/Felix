@@ -112,7 +112,7 @@ final class AccessibilityTextClient {
         guard suffixRange.length <= 4,
               let suffix = string(in: suffixRange, of: current.element),
               suffix.unicodeScalars.allSatisfy({
-                  CharacterSet.whitespacesAndNewlines.contains($0)
+                  CharacterSet.whitespaces.contains($0)
                       || CharacterSet(charactersIn: ".!?,;:").contains($0)
               })
         else { return nil }
@@ -133,7 +133,7 @@ final class AccessibilityTextClient {
             guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
             return CFEqual(focused, current.element)
                 && self.selectedRange(of: focused) == editRange
-                && self.string(in: editRange, of: focused) == selectedText
+                && self.selectedText(of: focused) == selectedText
         })
         else {
             restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
@@ -143,6 +143,7 @@ final class AccessibilityTextClient {
         guard let focused = focusedElement(expectedPID: expected.processID),
               CFEqual(focused, current.element), isSafe(focused, in: application),
               selectedRange(of: focused) == editRange,
+              self.selectedText(of: focused) == selectedText,
               string(in: editRange, of: focused) == selectedText
         else {
             restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
@@ -403,6 +404,17 @@ final class AccessibilityTextClient {
         var range = CFRange(location: 0, length: 0)
         guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    private func selectedText(of element: AXUIElement) -> String? {
+        if let markers = attribute("AXSelectedTextMarkerRange", of: element),
+           CFGetTypeID(markers) == AXTextMarkerRangeGetTypeID(),
+           let text = parameterizedAttribute(
+               "AXStringForTextMarkerRange", value: markers, of: element
+           ) as? String {
+            return text
+        }
+        return attribute(kAXSelectedTextAttribute, of: element) as? String
     }
 
     private func setSelection(_ range: NSRange, on element: AXUIElement) -> Bool {
