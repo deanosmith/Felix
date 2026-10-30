@@ -30,6 +30,7 @@ final class AutocorrectEngine: NSObject {
         let original: String
         let replacement: String
         let created: Date
+        var deletedTrailingCharacters = 0
     }
 
     var onChange: (() -> Void)?
@@ -182,12 +183,39 @@ final class AutocorrectEngine: NSObject {
 
     @discardableResult
     func undoLastCorrection() -> Bool {
-        guard canUndo, let record = undoRecord,
-              client.replace(
+        guard canUndo, let record = undoRecord else { return false }
+        var expected = record.snapshot
+        if record.deletedTrailingCharacters > 0 {
+            guard let current = client.snapshot(expectedPID: expected.processID) else {
+                setActivity(client.failureReason ?? "Correction undo skipped: focused field is unsupported")
+                return false
+            }
+            let contextOffset = expected.contextStart - current.contextStart
+            let currentText = current.text as NSString
+            let deletedRange = NSRange(
+                location: expected.caretOffset - record.deletedTrailingCharacters,
+                length: record.deletedTrailingCharacters
+            )
+            guard CFEqual(current.element, expected.element),
+                  current.selection.location
+                    == expected.selection.location - record.deletedTrailingCharacters,
+                  contextOffset >= 0, contextOffset <= currentText.length,
+                  currentText.substring(from: contextOffset)
+                    == (expected.text as NSString).replacingCharacters(in: deletedRange, with: "")
+            else {
+                setActivity("Correction undo skipped: text or focus changed")
+                return false
+            }
+            expected = current
+        }
+        guard client.replace(
                 range: record.range, original: record.replacement,
-                replacement: record.original, in: record.snapshot
+                replacement: record.original, in: expected
               ) != nil
-        else { return false }
+        else {
+            setActivity(client.failureReason ?? "Correction undo skipped: text or focus changed")
+            return false
+        }
         undoRecord = nil
         revision &+= 1
         activity = "Correction reverted"
@@ -231,6 +259,11 @@ final class AutocorrectEngine: NSObject {
         let undoKey = keyCode == kVK_Delete && modifiers.isEmpty
         let undoCommand = keyCode == kVK_ANSI_Z && modifiers == .maskCommand
             && !flags.contains(.maskShift)
+        if undoKey, canUndo, let record = undoRecord,
+           record.snapshot.selection.location - record.deletedTrailingCharacters > NSMaxRange(record.range) {
+            undoRecord?.deletedTrailingCharacters += 1
+            return false
+        }
         if (undoKey || undoCommand), undoLastCorrection() { return true }
         undoRecord = nil
 

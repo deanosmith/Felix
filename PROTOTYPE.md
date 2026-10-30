@@ -7,8 +7,11 @@
 3. If Settings reports keyboard access unavailable, use Settings > Input Monitoring
    Settings to grant access. macOS may require quitting and reopening it.
 4. In a supported prose field, type a lowercase typo such as `mispell`, then a space.
-5. Press Backspace or Command-Z immediately to revert a correction when the text
-   is unchanged.
+5. Backspace deletes the trailing space normally without reverting the correction.
+   Backspace at the end of the corrected word restores the original typo instead
+   of deleting its last character; any trailing punctuation is deleted normally
+   first. Command-Z reverts the correction immediately. Undo remains available
+   for 10 seconds, provided no other text or focus changes occur.
 
 The app runs behind a wrench icon in the menu bar, not the Dock. Its menu includes
 Pause, Sensitivity, Apps, Glow Colour..., Ignore Last Word, Settings, and Quit.
