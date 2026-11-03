@@ -55,12 +55,16 @@ actor CorrectionPolicy {
         let lowercase = word.lowercased()
         let titlecase = lowercase.prefix(1).uppercased() + lowercase.dropFirst()
         let minimumLength = sensitivity == .aggressive ? 2 : 3
+        let hasDoubleInitialCapitals = word.count >= 3
+            && word.prefix(2).allSatisfy(\.isUppercase)
+            && word.dropFirst(2).allSatisfy(\.isLowercase)
 
-        guard (minimumLength...32).contains(word.count),
+        guard word == "i" || (minimumLength...32).contains(word.count),
               word.unicodeScalars.allSatisfy({
                   (97...122).contains($0.value) || (65...90).contains($0.value)
               }),
-              word == lowercase || (sensitivity == .aggressive && word == titlecase),
+              word == lowercase || hasDoubleInitialCapitals
+                || (sensitivity == .aggressive && word == titlecase),
               !ignoredWords.contains(lowercase),
               !token.hasPrefix("."), !token.hasPrefix(":"),
               !looksTechnical(prefix)
@@ -71,14 +75,20 @@ actor CorrectionPolicy {
 
         let tokenRange = NSRange(tokenStart..<prefix.endIndex, in: prefix)
         let range = NSRange(location: tokenRange.location, length: (word as NSString).length)
+        if word == "i" {
+            return CorrectionCandidate(original: word, replacement: "I", range: range)
+        }
         let spelling = spellChecker.checkSpelling(
-            of: word,
+            of: hasDoubleInitialCapitals ? titlecase : word,
             startingAt: 0,
             language: language,
             wrap: false,
             inSpellDocumentWithTag: documentTag,
             wordCount: nil
         )
+        if spelling.location == NSNotFound, hasDoubleInitialCapitals, !Task.isCancelled {
+            return CorrectionCandidate(original: word, replacement: titlecase, range: range)
+        }
           guard spelling.location != NSNotFound, !Task.isCancelled,
               !isProperName(in: text, range: range), !Task.isCancelled
           else { return nil }

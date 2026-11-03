@@ -125,28 +125,25 @@ final class AccessibilityTextClient {
         failureReason = "Keyboard insertion permission needed"
         guard usesAccessibilityWrite || CGPreflightPostEventAccess() else { return nil }
 
-        let editRange = NSRange(location: range.location, length: range.length + suffixRange.length)
-        let selectedText = original + suffix
-        let insertedText = replacement + suffix
         failureReason = "Editor did not accept the correction selection"
-        guard setSelection(editRange, on: current.element), waitUntil({
+        guard setSelection(range, on: current.element), waitUntil({
             guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
             return CFEqual(focused, current.element)
-                && self.selectedRange(of: focused) == editRange
-                && self.selectedText(of: focused) == selectedText
+                && self.selectedRange(of: focused) == range
+                && self.selectedText(of: focused) == original
         })
         else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
+            restoreSelection(afterFailureIn: current, selected: range, original: original)
             return nil
         }
 
         guard let focused = focusedElement(expectedPID: expected.processID),
               CFEqual(focused, current.element), isSafe(focused, in: application),
-              selectedRange(of: focused) == editRange,
-              self.selectedText(of: focused) == selectedText,
-              string(in: editRange, of: focused) == selectedText
+              selectedRange(of: focused) == range,
+              self.selectedText(of: focused) == original,
+              string(in: range, of: focused) == original
         else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
+            restoreSelection(afterFailureIn: current, selected: range, original: original)
             return nil
         }
 
@@ -154,31 +151,45 @@ final class AccessibilityTextClient {
         let didInsert: Bool
         if usesAccessibilityWrite {
             didInsert = AXUIElementSetAttributeValue(
-                current.element, kAXSelectedTextAttribute as CFString, insertedText as CFString
+                current.element, kAXSelectedTextAttribute as CFString, replacement as CFString
             ) == .success
         } else {
-            didInsert = insertUsingKeyboard(insertedText, processID: expected.processID)
+            didInsert = insertUsingKeyboard(replacement, processID: expected.processID)
         }
         guard didInsert else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
+            restoreSelection(afterFailureIn: current, selected: range, original: original)
             return nil
         }
 
         let replacementLength = (replacement as NSString).length
         let caret = current.selection.location + replacementLength - range.length
-        let insertedRange = NSRange(location: range.location, length: (insertedText as NSString).length)
+        let replacementRange = NSRange(location: range.location, length: replacementLength)
+        let insertionCaret = NSRange(location: NSMaxRange(replacementRange), length: 0)
         guard waitUntil({
             guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
             return CFEqual(focused, current.element)
-                && self.string(in: insertedRange, of: focused) == insertedText
-                && self.selectedRange(of: focused) == NSRange(location: caret, length: 0)
-        }), let updated = snapshot(expectedPID: expected.processID)
+                && self.string(in: replacementRange, of: focused) == replacement
+                && self.selectedRange(of: focused) == insertionCaret
+        })
         else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: selectedText)
+            restoreSelection(afterFailureIn: current, selected: range, original: original)
             return nil
         }
 
-        let replacementRange = NSRange(location: range.location, length: replacementLength)
+        failureReason = "Editor did not restore the caret after correction"
+        let caretRange = NSRange(location: caret, length: 0)
+        let preservedSuffixRange = NSRange(
+            location: NSMaxRange(replacementRange), length: suffixRange.length
+        )
+        guard (caretRange == insertionCaret || setSelection(caretRange, on: current.element)),
+              waitUntil({
+                  guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
+                  return CFEqual(focused, current.element)
+                      && self.selectedRange(of: focused) == caretRange
+                      && self.string(in: preservedSuffixRange, of: focused) == suffix
+              }), let updated = snapshot(expectedPID: expected.processID)
+        else { return nil }
+
         return (
             snapshot: updated,
             bounds: bounds(of: replacementRange, in: updated)
@@ -257,7 +268,7 @@ final class AccessibilityTextClient {
         return [
             "com.google.chrome", "com.microsoft.edgemac", "com.brave.browser",
             "company.thebrowser.browser", "com.operasoftware.opera", "com.vivaldi.vivaldi",
-            "com.microsoft.vscode", "com.deanmsmith.notas.electron"
+            "com.microsoft.vscode", "com.deanmsmith.notas.electron", "com.tinyspeck.slackmacgap"
         ].contains(where: identifier.hasPrefix)
     }
 
