@@ -1,0 +1,1 @@
+zsh scripts/build-app.sh && open dist/Orth.app
