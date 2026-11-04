@@ -14,11 +14,12 @@
    for 10 seconds, provided no other text or focus changes occur.
 
 The app runs behind a wrench icon in the menu bar, not the Dock. Its menu includes
-Pause, Sensitivity, Apps, Glow Colour..., Ignore Last Word, Settings, and Quit.
+Pause, Sensitivity, Typing Profile, Apps, Glow Colour..., Ignore Last Correction,
+Settings, and Quit.
 Pause changes to Resume while paused. Settings contains status, the correction
 count, recent activity, Check Focused Field, Accessibility Settings, and Input
-Monitoring Settings. Ignore Last Word
-applies to the last corrected word; undo remains available through the keyboard.
+Monitoring Settings. Ignore Last Correction
+applies to the last corrected word or phrase; undo remains available through the keyboard.
 The wrench is filled while unpaused and outlined and dimmed while paused.
 A green wrench app icon also identifies Orth in
 Finder and macOS privacy settings. Ignoring a word saves it locally and attempts
@@ -155,11 +156,64 @@ for experimentation; subsequent choices are saved across restarts.
   limit, and also considers two-letter and initially capitalized words. Initial
   capitalization is preserved. Expect more incorrect replacements at this level.
 
-Every level requires the original word to fail spell checking. This is spelling
+Dictionary corrections require the original word to fail spell checking. This is spelling
 correction, not grammar rewriting or replacement of correctly spelled words.
 Secure-input, sensitive-field, technical-text, detected-name, ignored-word, and
 stale-text protections remain active at every level. Corrections still trigger
 after a space; sensitivity changes candidate acceptance, not the typing delay.
+
+## Typing Profile
+
+Typing Profile in the menu bar provides independent switches for double initial
+capitals (`THis` to `This`), prioritising accidental repeated-letter fixes, and
+repairing configured space mistakes. All three are enabled initially. Turning
+off repeated-letter prioritisation still allows Apple's normal spelling
+suggestions; it does not prohibit dictionary corrections of repeated letters.
+
+Edit Replacements... manages explicit personal rules, one `typo = correction`
+per line. Each side accepts one or two lowercase English words of up to 32
+letters each. Empty lines are allowed; duplicate typos and unchanged replacements
+are rejected without saving. Delete a line to remove a rule, or clear the editor
+to remove all rules. Initial capitalisation is preserved. Explicit rules take
+priority over spelling and name detection, but still respect macOS Text
+Replacements, ignored words, technical-text, secure-field, app, and stale-text
+protections.
+
+The initial rules are `thiis = this` and `thi s = this`. The split rule also
+supports `Thi sdog ` to `This dog `: Orth moves the configured stranded `s` only
+when the next token is misspelled and the remaining word is valid. Valid next
+words are not altered, and ambiguous competing repairs are skipped. The space
+between tokens must be one ordinary or non-breaking space, never a newline.
+Configured split prefixes such as `Thi ` are left unchanged while waiting for
+the next completed word. Disabling space repair disables multiword rules and
+this deferral. No general phrase joining or grammar rewriting is performed.
+
+Repeated-letter prioritisation only removes one adjacent duplicate from a
+misspelled word when it produces exactly one valid spelling; valid doubles such
+as `book` are untouched. Explicit personal rules remain active independently of
+this option. Double-capital words are skipped when their option is disabled.
+
+The profile is stored locally in the app's preferences, survives restarts, and
+is editable and resettable via Reset Typing Profile.... Reset requires
+confirmation and leaves ignored words and other settings unchanged. Profile
+changes cancel pending corrections and clear undo context; profile corrections
+otherwise use the existing guarded replacement, glow, and keyboard undo paths.
+No automatic learning, typing history, or network service is added.
+
+## macOS Text Replacements
+
+System Settings > Keyboard > Text Replacements takes priority over Orth.
+Before applying any correction, Orth checks the current system replacement
+dictionary and skips edits overlapping a shortcut, a partially typed multiword
+shortcut, or its expanded text. Matching respects word boundaries, ignores
+capitalisation, and handles non-breaking spaces used by web editors.
+Unrelated text remains eligible for correction. Orth does not expand the
+shortcuts itself, change macOS settings, or enable substitutions in apps that
+do not support them.
+
+Run the focused regression checks with `zsh scripts/test-text-replacements.sh`.
+They use isolated fixtures, do not modify system replacements, and require only
+Command Line Tools, not Xcode or XCTest.
 
 ## Build
 
@@ -200,7 +254,8 @@ be supplied with `ORTH_SIGNING_IDENTITY` for more stable attribution. The origin
   its source editors and terminal remain excluded.
 - Numbers and technical tokens such as URLs, emails, paths, and filenames with
   extensions are skipped. Code-looking lines and marked-text input methods are skipped.
-- Mixed-case and all-capital words are skipped to protect names and acronyms.
+- Mixed-case and all-capital words are skipped to protect names and acronyms,
+  except double initial capitals when enabled in Typing Profile.
   Conservative and Balanced also skip initially capitalized words. Named-entity
   detection remains active, but names and extensionless filenames cannot always
   be distinguished from typos. Ignore handles exceptions.

@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pause: NSMenuItem!
     private var ignore: NSMenuItem!
     private var sensitivityItems: [NSMenuItem] = []
+    private var typingProfileItems: [NSMenuItem] = []
     private var applicationFilterModeItems: [NSMenuItem] = []
     private let includedAppsMenu = NSMenu(title: "Included Apps")
     private let excludedAppsMenu = NSMenu(title: "Excluded Apps")
@@ -52,6 +53,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sensitivityMenu.addItem(option)
             sensitivityItems.append(option)
         }
+        let typingMenu = NSMenu(title: "Typing Profile")
+        typingMenu.autoenablesItems = false
+        let typingItem = NSMenuItem(title: "Typing Profile", action: nil, keyEquivalent: "")
+        typingItem.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "Typing Profile")
+        typingItem.submenu = typingMenu
+        menu.addItem(typingItem)
+        for (title, key) in [
+            ("Fix Double Capitals", "capitals"),
+            ("Prioritise Repeated-Letter Fixes", "repeats"),
+            ("Repair Configured Space Mistakes", "spaces")
+        ] {
+            let option = NSMenuItem(title: title, action: #selector(toggleTypingFeature(_:)), keyEquivalent: "")
+            option.target = self
+            option.representedObject = key
+            typingMenu.addItem(option)
+            typingProfileItems.append(option)
+        }
+        typingMenu.addItem(.separator())
+        add("Edit Replacements...", action: #selector(editReplacements), symbol: "pencil", to: typingMenu)
+        add("Reset Typing Profile...", action: #selector(resetTypingProfile), symbol: "arrow.counterclockwise", to: typingMenu)
         let applicationsMenu = NSMenu(title: "Apps")
         applicationsMenu.autoenablesItems = false
         let applicationsItem = NSMenuItem(title: "Apps", action: nil, keyEquivalent: "")
@@ -74,8 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             applicationsMenu.addItem(listItem)
         }
         add("Glow Colour...", action: #selector(chooseGlowColor), symbol: "paintpalette", to: menu)
-        ignore = add("Ignore Last Word", action: #selector(ignoreLast), symbol: "text.badge.minus", to: menu)
-        ignore.toolTip = "Ignore the last corrected word"
+        ignore = add("Ignore Last Correction", action: #selector(ignoreLast), symbol: "text.badge.minus", to: menu)
+        ignore.toolTip = "Ignore the original word or phrase from the last correction"
         let settingsMenu = NSMenu(title: "Settings")
         settingsMenu.autoenablesItems = false
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
@@ -190,6 +211,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for option in sensitivityItems {
             option.state = (option.representedObject as? String) == engine.sensitivity.rawValue ? .on : .off
         }
+        for option in typingProfileItems {
+            let enabled: Bool
+            switch option.representedObject as? String {
+            case "capitals": enabled = engine.typingProfile.fixesCapitals
+            case "repeats": enabled = engine.typingProfile.fixesRepeatedLetters
+            case "spaces": enabled = engine.typingProfile.fixesSpaces
+            default: enabled = false
+            }
+            option.state = enabled ? .on : .off
+        }
         for option in applicationFilterModeItems {
             option.state = (option.representedObject as? String) == engine.applicationFilter.mode.rawValue ? .on : .off
         }
@@ -279,6 +310,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let value = CorrectionSensitivity(rawValue: rawValue)
         else { return }
         engine.setSensitivity(value)
+    }
+
+    @objc private func toggleTypingFeature(_ sender: NSMenuItem) {
+        var profile = engine.typingProfile
+        switch sender.representedObject as? String {
+        case "capitals": profile.fixesCapitals.toggle()
+        case "repeats": profile.fixesRepeatedLetters.toggle()
+        case "spaces": profile.fixesSpaces.toggle()
+        default:
+            NSSound.beep()
+            return
+        }
+        saveTypingProfile(profile)
+    }
+
+    @objc private func editReplacements() {
+        let alert = NSAlert()
+        alert.messageText = "Personal Replacements"
+        alert.informativeText = "Use lowercase English words: typo = correction, one per line. Each side can contain one or two words. Initial capitalisation is preserved. These explicit rules override spelling and name detection, but not protected fields, technical text, or ignored words."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 220))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let editor = NSTextView(frame: scroll.contentView.bounds)
+        editor.isRichText = false
+        editor.isAutomaticQuoteSubstitutionEnabled = false
+        editor.isAutomaticDashSubstitutionEnabled = false
+        editor.isAutomaticTextReplacementEnabled = false
+        editor.isAutomaticSpellingCorrectionEnabled = false
+        editor.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        editor.isVerticallyResizable = true
+        editor.autoresizingMask = [.width]
+        editor.textContainer?.widthTracksTextView = true
+        editor.string = engine.typingProfile.replacementText
+        scroll.documentView = editor
+        alert.accessoryView = scroll
+        alert.window.initialFirstResponder = editor
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        while alert.runModal() == .alertFirstButtonReturn {
+            do {
+                var profile = engine.typingProfile
+                profile.replacements = try TypingProfile.parseReplacements(editor.string)
+                try engine.setTypingProfile(profile)
+                return
+            } catch {
+                showTypingProfileError(error)
+            }
+        }
+    }
+
+    @objc private func resetTypingProfile() {
+        let alert = NSAlert()
+        alert.messageText = "Reset Typing Profile?"
+        alert.informativeText = "This restores the default typing options and replacements, removing your custom replacements. Ignored words and other settings are unchanged."
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        saveTypingProfile(TypingProfile())
+    }
+
+    private func saveTypingProfile(_ profile: TypingProfile) {
+        do {
+            try engine.setTypingProfile(profile)
+        } catch {
+            showTypingProfileError(error)
+        }
+    }
+
+    private func showTypingProfileError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Unable to Update Typing Profile"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
     }
 
     @objc private func chooseGlowColor() {

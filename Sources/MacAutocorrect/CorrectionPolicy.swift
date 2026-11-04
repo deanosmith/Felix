@@ -24,9 +24,16 @@ actor CorrectionPolicy {
         ?? "en_US"
     private let defaults: UserDefaults
     private var ignoredWords: Set<String>
+    private let replacementProvider: @Sendable () -> [String: String]
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        replacementProvider: @escaping @Sendable () -> [String: String] = {
+            NSSpellChecker.shared.userReplacementsDictionary
+        }
+    ) {
         self.defaults = defaults
+        self.replacementProvider = replacementProvider
         ignoredWords = Set((defaults.stringArray(forKey: "ignoredWords") ?? []).map { $0.lowercased() })
     }
 
@@ -36,7 +43,60 @@ actor CorrectionPolicy {
     }
 
     func correction(
-        in text: String, caretOffset: Int, sensitivity: CorrectionSensitivity = .conservative
+        in text: String, caretOffset: Int, sensitivity: CorrectionSensitivity = .conservative,
+        profile: TypingProfile = TypingProfile()
+    ) -> CorrectionCandidate? {
+        guard let candidate = proposedCorrection(
+            in: text, caretOffset: caretOffset, sensitivity: sensitivity, profile: profile
+        ), !overlapsSystemReplacement(candidate, in: text, caretOffset: caretOffset)
+        else { return nil }
+        return candidate
+    }
+
+    private func overlapsSystemReplacement(
+        _ candidate: CorrectionCandidate, in text: String, caretOffset: Int
+    ) -> Bool {
+        let prefix = (text as NSString).substring(to: caretOffset)
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+        var protected: Set<String> = []
+        for (shortcut, expansion) in replacementProvider() {
+            protected.insert(shortcut)
+            protected.insert(expansion)
+            // Do not rewrite the first word before a multiword shortcut is complete.
+            for index in shortcut.indices where shortcut[index].isWhitespace {
+                protected.insert(String(shortcut[..<index]))
+            }
+        }
+
+        func isWordCharacter(_ character: Character) -> Bool {
+            character.isLetter || character.isNumber || character == "_"
+        }
+
+        for phrase in protected {
+            let phrase = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\u{00A0}", with: " ")
+            guard let first = phrase.first, let last = phrase.last else { continue }
+            var start = prefix.startIndex
+            while let match = prefix.range(
+                of: phrase, options: .caseInsensitive, range: start..<prefix.endIndex
+            ) {
+                let startsAtBoundary = !isWordCharacter(first) || match.lowerBound == prefix.startIndex
+                    || !isWordCharacter(prefix[prefix.index(before: match.lowerBound)])
+                let endsAtBoundary = !isWordCharacter(last) || match.upperBound == prefix.endIndex
+                    || !isWordCharacter(prefix[match.upperBound])
+                if startsAtBoundary, endsAtBoundary,
+                   NSIntersectionRange(candidate.range, NSRange(match, in: prefix)).length > 0 {
+                    return true
+                }
+                start = match.upperBound
+            }
+        }
+        return false
+    }
+
+    private func proposedCorrection(
+        in text: String, caretOffset: Int, sensitivity: CorrectionSensitivity,
+        profile: TypingProfile
     ) -> CorrectionCandidate? {
         guard !Task.isCancelled else { return nil }
         let source = text as NSString
@@ -52,6 +112,14 @@ actor CorrectionPolicy {
             .map { prefix.index(after: $0) } ?? prefix.startIndex
         let token = String(prefix[tokenStart...])
         let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
+        if let previous = prefix[..<tokenStart].split(whereSeparator: { $0.isWhitespace }).last,
+           ignoredWords.contains((previous + " " + word).lowercased()) {
+            return nil
+        }
+        guard !looksTechnical(prefix) else { return nil }
+        if let personal = personalCorrection(in: prefix, profile: profile) {
+            return personal
+        }
         let lowercase = word.lowercased()
         let titlecase = lowercase.prefix(1).uppercased() + lowercase.dropFirst()
         let minimumLength = sensitivity == .aggressive ? 2 : 3
@@ -63,12 +131,18 @@ actor CorrectionPolicy {
               word.unicodeScalars.allSatisfy({
                   (97...122).contains($0.value) || (65...90).contains($0.value)
               }),
-              word == lowercase || hasDoubleInitialCapitals
+              word == lowercase || (profile.fixesCapitals && hasDoubleInitialCapitals)
                 || (sensitivity == .aggressive && word == titlecase),
               !ignoredWords.contains(lowercase),
-              !token.hasPrefix("."), !token.hasPrefix(":"),
-              !looksTechnical(prefix)
+              !token.hasPrefix("."), !token.hasPrefix(":")
         else { return nil }
+
+        // Leave configured split-word prefixes intact until the next word is complete.
+        if profile.fixesSpaces, profile.replacements.keys.contains(where: {
+            $0.hasPrefix(lowercase + " ") && token == word
+        }) {
+            return nil
+        }
 
         let punctuationLength = (token as NSString).length - (word as NSString).length
         guard punctuationLength <= 1 else { return nil }
@@ -92,6 +166,11 @@ actor CorrectionPolicy {
           guard spelling.location != NSNotFound, !Task.isCancelled,
               !isProperName(in: text, range: range), !Task.isCancelled
           else { return nil }
+
+        if profile.fixesRepeatedLetters,
+           let replacement = repeatedLetterCorrection(for: word) {
+            return CorrectionCandidate(original: word, replacement: replacement, range: range)
+        }
 
         let automatic = spellChecker.correction(
             forWordRange: range,
@@ -121,8 +200,114 @@ actor CorrectionPolicy {
     }
 
     func ignore(_ word: String) {
-        ignoredWords.insert(word.lowercased())
+        ignoredWords.insert(word.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " "))
         defaults.set(ignoredWords.sorted(), forKey: "ignoredWords")
+    }
+
+    private func personalCorrection(in prefix: String, profile: TypingProfile) -> CorrectionCandidate? {
+        let tokenStart = prefix.lastIndex(where: { $0.isWhitespace })
+            .map { prefix.index(after: $0) } ?? prefix.startIndex
+        let token = String(prefix[tokenStart...])
+        let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
+        guard token == word || token == word + String(token.suffix(1)) else { return nil }
+
+        var start = tokenStart
+        if profile.fixesSpaces, tokenStart > prefix.startIndex {
+            let separator = prefix.index(before: tokenStart)
+            if prefix[separator] == " " || prefix[separator] == "\u{00A0}" {
+                let before = prefix[..<separator]
+                start = before.lastIndex(where: { $0.isWhitespace })
+                    .map { prefix.index(after: $0) } ?? prefix.startIndex
+            }
+        }
+        let preceding = String(prefix[start..<tokenStart])
+        let phrase = preceding + word
+        let normalizedPhrase = phrase.replacingOccurrences(of: "\u{00A0}", with: " ").lowercased()
+        if profile.fixesSpaces, start < tokenStart,
+           let replacement = profile.replacements[normalizedPhrase],
+           canPersonalize(phrase, profile: profile) {
+            return personalCandidate(phrase, replacement: replacement, start: start, in: prefix)
+        }
+
+        // Only move a stranded letter for an explicitly configured split, never a valid next word.
+        if profile.fixesSpaces, start < tokenStart, !isSpelledCorrectly(word),
+           canPersonalize(phrase, profile: profile) {
+            var candidates: [String] = []
+            for (typo, replacement) in profile.replacements {
+                let parts = typo.split(separator: " ")
+                guard parts.count == 2, parts[1].count == 1,
+                      preceding.lowercased().trimmingCharacters(in: .whitespaces) == parts[0],
+                      word.lowercased().hasPrefix(parts[1])
+                else { continue }
+                let remainder = String(word.dropFirst())
+                guard remainder.count >= 2, isSpelledCorrectly(remainder),
+                      !isProperName(in: prefix, range: NSRange(tokenStart..<prefix.endIndex, in: prefix))
+                else { continue }
+                candidates.append(replacement + " " + remainder)
+            }
+            if Set(candidates).count == 1, let replacement = candidates.first {
+                return personalCandidate(phrase, replacement: replacement, start: start, in: prefix)
+            }
+        }
+
+        guard let replacement = profile.replacements[word.lowercased()],
+              profile.fixesSpaces || !replacement.contains(" "),
+              canPersonalize(word, profile: profile)
+        else { return nil }
+        return personalCandidate(word, replacement: replacement, start: tokenStart, in: prefix)
+    }
+
+    private func canPersonalize(_ phrase: String, profile: TypingProfile) -> Bool {
+        let lowercase = phrase.lowercased()
+        guard !ignoredWords.contains(lowercase.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")),
+              !phrase.split(whereSeparator: { $0.isWhitespace }).contains(where: {
+                  ignoredWords.contains($0.lowercased())
+              })
+        else { return false }
+        let titlecase = lowercase.prefix(1).uppercased() + lowercase.dropFirst()
+        let firstWord = phrase.split(whereSeparator: { $0.isWhitespace }).first ?? ""
+        let doubleCapitals = firstWord.count >= 3 && firstWord.prefix(2).allSatisfy(\.isUppercase)
+            && firstWord.dropFirst(2).allSatisfy(\.isLowercase)
+            && phrase.dropFirst(2) == lowercase.dropFirst(2)
+        return phrase == lowercase || phrase == titlecase
+            || (profile.fixesCapitals && doubleCapitals)
+    }
+
+    private func personalCandidate(
+        _ original: String, replacement: String, start: String.Index, in prefix: String
+    ) -> CorrectionCandidate {
+        let cased = original.first?.isUppercase == true
+            ? replacement.prefix(1).uppercased() + replacement.dropFirst() : replacement
+        return CorrectionCandidate(
+            original: original, replacement: cased,
+            range: NSRange(location: NSRange(prefix.startIndex..<start, in: prefix).length,
+                           length: (original as NSString).length)
+        )
+    }
+
+    private func isSpelledCorrectly(_ word: String) -> Bool {
+        guard word.count >= 2,
+              word.unicodeScalars.allSatisfy({
+                  (97...122).contains($0.value) || (65...90).contains($0.value)
+              })
+        else { return false }
+        return spellChecker.checkSpelling(
+            of: word.lowercased(), startingAt: 0, language: language, wrap: false,
+            inSpellDocumentWithTag: documentTag, wordCount: nil
+        ).location == NSNotFound
+    }
+
+    private func repeatedLetterCorrection(for word: String) -> String? {
+        let letters = Array(word.lowercased())
+        var candidates: Set<String> = []
+        for index in 1..<letters.count where letters[index] == letters[index - 1] {
+            var shortened = letters
+            shortened.remove(at: index)
+            let candidate = String(shortened)
+            if isSpelledCorrectly(candidate) { candidates.insert(candidate) }
+        }
+        guard candidates.count == 1, let candidate = candidates.first else { return nil }
+        return normalizedReplacement(candidate, for: word)
     }
 
     private func normalizedReplacement(_ suggestion: String, for word: String) -> String? {

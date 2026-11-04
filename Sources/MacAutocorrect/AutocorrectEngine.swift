@@ -42,6 +42,7 @@ final class AutocorrectEngine: NSObject {
     private(set) var correctionCount = 0
     private(set) var lastCorrection: CorrectionCandidate?
     private(set) var activity = "Waiting for a completed word"
+    private(set) var typingProfile = TypingProfile.load()
 
     let applicationFilter = ApplicationFilter()
     private lazy var client = AccessibilityTextClient(applicationFilter: applicationFilter)
@@ -141,6 +142,17 @@ final class AutocorrectEngine: NSObject {
         guard applicationFilter.mode != mode else { return }
         applicationFilter.setMode(mode)
         applicationFilterChanged()
+    }
+
+    func setTypingProfile(_ profile: TypingProfile) throws {
+        try profile.save()
+        typingProfile = profile
+        revision &+= 1
+        pendingCorrection?.cancel()
+        pendingCorrection = nil
+        undoRecord = nil
+        setActivity("Typing profile updated")
+        onChange?()
     }
 
     func setApplication(_ identifier: String, selected: Bool, in list: ApplicationFilterMode) {
@@ -332,7 +344,8 @@ final class AutocorrectEngine: NSObject {
 
         stage = "Checking spelling"
         guard let candidate = await policy.correction(
-                in: snapshot.text, caretOffset: snapshot.caretOffset, sensitivity: sensitivity
+                in: snapshot.text, caretOffset: snapshot.caretOffset, sensitivity: sensitivity,
+                profile: typingProfile
               ) else {
             guard !Task.isCancelled, self.revision == revision else { return }
             setActivity("No change: protected word or no spelling suggestion")
