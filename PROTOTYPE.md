@@ -72,15 +72,29 @@ or technical-text safeguards.
 
 ## Browser Access and Diagnostics
 
-Chrome and Electron text fields do not always advertise usable selected-text
-writes. Orth enables the accessibility tree for supported browsers, Notas, and
-VS Code, selects only the completed word and its trailing separator, then reads
-the selection back before editing. These Chromium-based editors use normal
-Unicode keyboard input rather than selected-text writes, which can be advertised
-without actually applying an edit. Other editors use keyboard input when
+Chrome, Electron, and embedded WebKit text fields do not always advertise usable
+selected-text writes. Orth enables the accessibility tree for supported browsers, Notas, and
+VS Code, selects only the completed word and its trailing punctuation and spaces,
+then reads the selection back before editing. In web editors, the selection is
+anchored to the original caret's text markers rather than numeric offsets:
+Chromium can map a numeric end-of-paragraph position into the next paragraph,
+silently merging or deleting that line even though the selected text looks right.
+Web editors without writable text markers are skipped instead of using that
+unsafe numeric fallback. The same suffix is included unchanged in the replacement,
+leaving the caret naturally after it without another selection write.
+
+Chromium-based editors and fields inside embedded web views use normal Unicode
+keyboard input rather than selected-text writes, which can report success without
+actually applying an edit. This also covers the Python Grok overlay's WebKit
+composer. Other editors use keyboard input when
 selected-text writes are unavailable. Events enter after Orth's own monitoring
 tap so its read-back wait cannot block them. Focus and selection are checked
 immediately before insertion, and the clipboard is never used.
+
+Editable combo boxes are supported alongside text fields and text areas, including
+the Grok composer in the Python-based macOS overlay's embedded WebKit view.
+They must expose readable text and a writable caret and pass the same sensitive-field
+and technical-text safeguards as other inputs.
 
 Focus is read from the active app first, with the system-wide focus as a fallback.
 Some Chromium fields report more characters than their ranged-text API can read,
