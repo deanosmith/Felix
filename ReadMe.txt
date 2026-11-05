@@ -1,1 +1,0 @@
-zsh scripts/build-app.sh && open dist/Felix.app
