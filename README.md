@@ -29,3 +29,7 @@ cd felix
 zsh scripts/build-app.sh
 open dist/Felix.app
 ```
+
+--- 
+Fix It Felix 
+(Please don't sue me Disney)
