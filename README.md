@@ -31,5 +31,5 @@ open dist/Felix.app
 ```
 
 --- 
-Fix It Felix 
+Fix-It-Felix 
 (Please don't sue me Disney)
