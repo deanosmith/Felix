@@ -198,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "Orth"
+        image.accessibilityDescription = "Felix"
         return image
     }
 
@@ -226,11 +226,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         ignore.isEnabled = engine.lastCorrection != nil
         statusItem?.button?.image = showingCorrection
-            ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Orth")
+            ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Felix")
             : wrenchImage(filled: !engine.isPaused)
         statusItem?.button?.contentTintColor = showingCorrection ? .systemGreen
             : (engine.isPaused ? .secondaryLabelColor : nil)
-        statusItem?.button?.toolTip = "Orth: \(engine.status) (\(engine.sensitivity.title))"
+        statusItem?.button?.toolTip = "Felix: \(engine.status) (\(engine.sensitivity.title))"
     }
 
     private func showCorrection(at rectangle: CGRect?) {

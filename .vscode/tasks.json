@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build Orth",
+            "label": "Build Felix",
             "type": "process",
             "command": "zsh",
             "args": ["${workspaceFolder}/scripts/build-app.sh"],
@@ -10,10 +10,17 @@
             "problemMatcher": []
         },
         {
-            "label": "Run Orth",
+            "label": "Run Felix",
             "type": "process",
             "command": "open",
-            "args": ["${workspaceFolder}/dist/Orth.app"],
+            "args": ["${workspaceFolder}/dist/Felix.app"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Test Text Replacements",
+            "type": "process",
+            "command": "zsh",
+            "args": ["${workspaceFolder}/scripts/test-text-replacements.sh"],
             "problemMatcher": []
         }
     ]

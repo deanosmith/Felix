@@ -18,7 +18,7 @@ struct TypingProfile: Codable, Equatable, Sendable {
             }
             return profile
         } catch {
-            Logger(subsystem: "local.deanmsmith.MacAutocorrect", category: "Correction")
+            Logger(subsystem: "local.deanmsmith.Felix", category: "Correction")
                 .error("Unable to load typing profile: \(error.localizedDescription, privacy: .public)")
             return TypingProfile()
         }

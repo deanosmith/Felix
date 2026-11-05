@@ -4,21 +4,21 @@
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:Orth}",
-            "name": "Debug Orth",
-            "target": "Orth",
+            "cwd": "${workspaceFolder}",
+            "name": "Debug Felix",
+            "target": "Felix",
             "configuration": "debug",
-            "preLaunchTask": "swift: Build Debug Orth"
+            "preLaunchTask": "swift: Build Debug Felix"
         },
         {
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:Orth}",
-            "name": "Release Orth",
-            "target": "Orth",
+            "cwd": "${workspaceFolder}",
+            "name": "Release Felix",
+            "target": "Felix",
             "configuration": "release",
-            "preLaunchTask": "swift: Build Release Orth"
+            "preLaunchTask": "swift: Build Release Felix"
         }
     ]
 }

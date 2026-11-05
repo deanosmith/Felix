@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "Orth",
+    name: "Felix",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "Orth", targets: ["MacAutocorrect"])
+        .executable(name: "Felix", targets: ["Felix"])
     ],
     targets: [
-        .executableTarget(name: "MacAutocorrect")
+        .executableTarget(name: "Felix")
     ]
 )

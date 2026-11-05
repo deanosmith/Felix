@@ -4,7 +4,7 @@ import Carbon
 import OSLog
 
 private let eventCallback: CGEventTapCallBack = { _, type, event, context in
-    if type == .keyDown, event.getIntegerValueField(.eventSourceUserData) == orthSyntheticEventTag {
+    if type == .keyDown, event.getIntegerValueField(.eventSourceUserData) == felixSyntheticEventTag {
         return Unmanaged.passUnretained(event)
     }
     guard let context else { return Unmanaged.passUnretained(event) }
@@ -47,13 +47,17 @@ final class AutocorrectEngine: NSObject {
     let applicationFilter = ApplicationFilter()
     private lazy var client = AccessibilityTextClient(applicationFilter: applicationFilter)
     private let policy = CorrectionPolicy()
-    private let permissionLog = Logger(subsystem: "local.deanmsmith.MacAutocorrect", category: "Permissions")
-    private let correctionLog = Logger(subsystem: "local.deanmsmith.MacAutocorrect", category: "Correction")
+    private let permissionLog = Logger(subsystem: "local.deanmsmith.Felix", category: "Permissions")
+    private let correctionLog = Logger(subsystem: "local.deanmsmith.Felix", category: "Correction")
     private var receivedKeyboardEvent = false
     private var reportedStatus: String?
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var permissionTimer: Timer?
+    private var permissionRefresh: Task<Void, Never>?
+    private var hasAccessibilityAccess = false
+    private var tapIsSuspended = false
+    private var isStopped = true
     private var revision: UInt64 = 0
     private var menuIsOpen = false
     private var undoRecord: UndoRecord?
@@ -62,11 +66,11 @@ final class AutocorrectEngine: NSObject {
     private var spellingIsReady = false
 
     var status: String {
-        if !AXIsProcessTrusted() { return "Accessibility permission needed" }
+        if !hasAccessibilityAccess { return "Accessibility permission needed" }
         if isPaused { return "Paused" }
         if IsSecureEventInputEnabled() { return "Secure input active - suspended" }
+        if tapIsSuspended { return "Keyboard monitoring stopped" }
         if tap == nil { return "Keyboard access unavailable" }
-        if let tap, !CGEvent.tapIsEnabled(tap: tap) { return "Keyboard monitoring interrupted" }
         if let application = NSWorkspace.shared.frontmostApplication {
             if !applicationFilter.allows(application.bundleIdentifier) {
                 return "App excluded - suspended"
@@ -83,6 +87,7 @@ final class AutocorrectEngine: NSObject {
     }
 
     func start() {
+        isStopped = false
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(applicationChanged),
             name: NSWorkspace.didActivateApplicationNotification, object: nil
@@ -101,24 +106,28 @@ final class AutocorrectEngine: NSObject {
     }
 
     func stop() {
+        isStopped = true
         revision &+= 1
         pendingCorrection?.cancel()
         pendingCorrection = nil
         undoRecord = nil
         permissionTimer?.invalidate()
         permissionTimer = nil
+        permissionRefresh?.cancel()
+        permissionRefresh = nil
+        hasAccessibilityAccess = false
+        client.hasAccessibilityAccess = false
+        client.hasKeyboardInsertionAccess = false
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopTap()
     }
 
     func requestAccessibilityPermission() {
-        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-        refreshAccess()
+        refreshAccess(promptAccessibility: true)
     }
 
     func requestKeyboardPermission() {
-        _ = CGRequestListenEventAccess()
-        refreshAccess()
+        refreshAccess(promptKeyboard: true)
     }
 
     func togglePaused() {
@@ -126,7 +135,9 @@ final class AutocorrectEngine: NSObject {
         UserDefaults.standard.set(isPaused, forKey: "isPaused")
         revision &+= 1
         undoRecord = nil
+        if !isPaused { tapIsSuspended = false }
         refreshAccess()
+        onChange?()
     }
 
     func setSensitivity(_ value: CorrectionSensitivity) {
@@ -178,7 +189,7 @@ final class AutocorrectEngine: NSObject {
     }
 
     func inspectFocusedField() {
-        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled() else {
+        guard hasAccessibilityAccess, !IsSecureEventInputEnabled() else {
             setActivity(status)
             return
         }
@@ -256,15 +267,18 @@ final class AutocorrectEngine: NSObject {
 
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             undoRecord = nil
-            correctionLog.warning("Keyboard monitoring interrupted; restarting tap")
-            if let tap, !isPaused, AXIsProcessTrusted() {
-                CGEvent.tapEnable(tap: tap, enable: true)
+            tapIsSuspended = true
+            correctionLog.warning("Keyboard monitoring stopped after the input tap was disabled")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, tapIsSuspended else { return }
+                stopTap()
+                refreshAccess()
             }
             return false
         }
 
-        guard type == .keyDown, !isPaused, !menuIsOpen,
-              !IsSecureEventInputEnabled(), AXIsProcessTrusted()
+        guard type == .keyDown, !isPaused, !menuIsOpen, !tapIsSuspended,
+              !IsSecureEventInputEnabled(), hasAccessibilityAccess
         else { return false }
 
         let modifiers = flags.intersection([.maskCommand, .maskControl, .maskAlternate])
@@ -395,10 +409,48 @@ final class AutocorrectEngine: NSObject {
         DispatchQueue.main.async { [weak self] in self?.onChange?() }
     }
 
-    private func refreshAccess() {
-        if !canUndo { undoRecord = nil }
-        if isPaused || !AXIsProcessTrusted() {
+    private func refreshAccess(promptAccessibility: Bool = false, promptKeyboard: Bool = false) {
+        guard !isStopped else { return }
+        if isPaused || tapIsSuspended || promptAccessibility || promptKeyboard {
             revision &+= 1
+            pendingCorrection?.cancel()
+            pendingCorrection = nil
+            undoRecord = nil
+            stopTap()
+        }
+        if promptAccessibility || promptKeyboard {
+            tapIsSuspended = false
+            permissionRefresh?.cancel()
+            permissionRefresh = nil
+        }
+        guard permissionRefresh == nil else { return }
+        permissionRefresh = Task { [weak self] in
+            let access = await Task.detached {
+                if promptAccessibility {
+                    _ = AXIsProcessTrustedWithOptions(
+                        ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+                    )
+                }
+                if promptKeyboard { _ = CGRequestListenEventAccess() }
+                let trusted = AXIsProcessTrusted()
+                return (trusted: trusted, canInsert: trusted && CGPreflightPostEventAccess())
+            }.value
+            guard let self, !Task.isCancelled, !isStopped else { return }
+            permissionRefresh = nil
+            applyAccess(trusted: access.trusted, canInsert: access.canInsert)
+        }
+    }
+
+    private func applyAccess(trusted: Bool, canInsert: Bool) {
+        if trusted && !hasAccessibilityAccess { tapIsSuspended = false }
+        hasAccessibilityAccess = trusted
+        client.hasAccessibilityAccess = trusted
+        client.hasKeyboardInsertionAccess = canInsert
+        if !canUndo { undoRecord = nil }
+        if isPaused || !trusted || tapIsSuspended {
+            revision &+= 1
+            pendingCorrection?.cancel()
+            pendingCorrection = nil
             undoRecord = nil
             stopTap()
         } else if tap == nil {
@@ -415,13 +467,10 @@ final class AutocorrectEngine: NSObject {
                 source = newSource
                 CFRunLoopAddSource(CFRunLoopGetMain(), newSource, .commonModes)
                 CGEvent.tapEnable(tap: newTap, enable: true)
+            } else {
+                tapIsSuspended = true
+                correctionLog.error("Keyboard monitoring stopped because the input tap could not be created")
             }
-        } else if let tap, !CGEvent.tapIsEnabled(tap: tap) {
-            revision &+= 1
-            pendingCorrection?.cancel()
-            undoRecord = nil
-            CGEvent.tapEnable(tap: tap, enable: true)
-            correctionLog.notice("Keyboard monitoring restored")
         }
         if let application = NSWorkspace.shared.frontmostApplication, client.allows(application) {
             client.prepare(application)

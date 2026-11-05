@@ -1,8 +1,8 @@
-# Orth Prototype
+# Felix Prototype
 
 ## Run
 
-1. Open `dist/Orth.app`.
+1. Open `dist/Felix.app`.
 2. Grant the app access in System Settings > Privacy & Security > Accessibility.
 3. If Settings reports keyboard access unavailable, use Settings > Input Monitoring
    Settings to grant access. macOS may require quitting and reopening it.
@@ -21,7 +21,7 @@ count, recent activity, Check Focused Field, Accessibility Settings, and Input
 Monitoring Settings. Ignore Last Correction
 applies to the last corrected word or phrase; undo remains available through the keyboard.
 The wrench is filled while unpaused and outlined and dimmed while paused.
-A green wrench app icon also identifies Orth in
+A green wrench app icon also identifies Felix in
 Finder and macOS privacy settings. Ignoring a word saves it locally and attempts
 to revert that correction if the text is still unchanged.
 
@@ -43,7 +43,7 @@ overlapping glows coexist, and new corrections do not restart or hide earlier
 ones. No feedback is shown for an unconfirmed replacement.
 
 Chromium editors can return empty rectangles for numeric text ranges even when
-correction works. If numeric word bounds are unavailable, Orth derives an exact
+correction works. If numeric word bounds are unavailable, Felix derives an exact
 word-only text-marker range from the confirmed post-replacement caret and checks
 that its text matches the corrected word before requesting bounds. It never uses
 the replacement selection's bounds, which include the trailing separator.
@@ -53,7 +53,7 @@ word bounds are unavailable; the menu-bar checkmark still confirms the edit.
 
 ## Applications
 
-Use Apps in the menu bar to choose which apps Orth can correct:
+Use Apps in the menu bar to choose which apps Felix can correct:
 
 - All Apps Except Excluded is the default and preserves the original behavior
   until you add exclusions.
@@ -74,23 +74,22 @@ or technical-text safeguards.
 ## Browser Access and Diagnostics
 
 Chrome, Electron, and embedded WebKit text fields do not always advertise usable
-selected-text writes. Orth enables the accessibility tree for supported browsers, Notas, and
-VS Code, selects only the completed word and its trailing punctuation and spaces,
-then reads the selection back before editing. In web editors, the selection is
-anchored to the original caret's text markers rather than numeric offsets:
+selected-text writes. Felix enables the accessibility tree for supported browsers,
+Notas, and VS Code. It moves a collapsed caret to the completed word's start without
+highlighting text. In web editors, this caret is anchored to the original caret's
+text markers rather than numeric offsets:
 Chromium can map a numeric end-of-paragraph position into the next paragraph,
 silently merging or deleting that line even though the selected text looks right.
 Web editors without writable text markers are skipped instead of using that
-unsafe numeric fallback. The same suffix is included unchanged in the replacement,
-leaving the caret naturally after it without another selection write.
+unsafe numeric fallback.
 
-Chromium-based editors and fields inside embedded web views use normal Unicode
-keyboard input rather than selected-text writes, which can report success without
-actually applying an edit. This also covers the Python Grok overlay's WebKit
-composer. Other editors use keyboard input when
-selected-text writes are unavailable. Events enter after Orth's own monitoring
-tap so its read-back wait cannot block them. Focus and selection are checked
-immediately before insertion, and the clipboard is never used.
+Corrections insert Unicode text before the original word, preserving its trailing
+spaces and punctuation. Only after the editor confirms the inserted text, caret,
+focus, and surrounding context does Felix forward-delete the original word and
+suffix. The confirmed replacement remains behind the caret, outside the deletion
+range. Events target the verified app process, and the clipboard is never used.
+This also covers the Python Grok overlay's WebKit composer. A correction and its
+glow are reported only after the final text and caret are confirmed.
 
 Editable combo boxes are supported alongside text fields and text areas, including
 the Grok composer in the Python-based macOS overlay's embedded WebKit view.
@@ -100,7 +99,7 @@ and technical-text safeguards as other inputs.
 Focus is read from the active app first, with the system-wide focus as a fallback.
 Some Chromium fields report more characters than their ranged-text API can read,
 and their whole-field value can use different offsets. If the read extending past
-the caret fails, Orth reads only through the caret. Bounded whole-field values are
+the caret fails, Felix reads only through the caret. Bounded whole-field values are
 used only when the ranged-text API is unsupported, not when a supported range read
 fails. This keeps the completed word and its separator aligned with the editor's
 selection ranges instead of incorrectly reporting a missing space.
@@ -114,34 +113,38 @@ code-looking text remain protected, including inside chat.
 For VS Code's native EditContext chat input, set Editor: Accessibility Support
 to On (`"editor.accessibilitySupport": "on"` in VS Code settings). With this
 setting explicitly Off, VS Code can expose an empty accessibility buffer even
-while text is being entered. Orth does not bypass unreadable-field safeguards
+while text is being entered. Felix does not bypass unreadable-field safeguards
 or change this preference automatically. Enabling it also turns on VS Code's
 screen-reader optimizations.
 
-Selection and insertion updates have short, bounded read-back waits. A rejected
-replacement restores the original caret when the selected text is unchanged,
-rather than leaving the typo selected. Secure fields and protected apps remain
-excluded.
+Caret and insertion updates have short, bounded read-back waits. Rejected or
+unverified insertion never triggers removal of the original text. If removal or
+final verification fails, duplicate or partially removed original text can remain;
+Felix keeps the confirmed replacement rather than attempting another destructive
+edit. It attempts to restore the original caret only when the text and focus are
+unchanged. Secure fields and protected apps remain excluded.
 
 Focus the WhatsApp message composer, choose Settings > Check Focused Field from
-Orth's menu, then reopen Settings to read the result. The activity line also reports why the
+Felix's menu, then reopen Settings to read the result. The activity line also reports why the
 last attempted correction was skipped. This distinguishes permission problems
 from unsupported fields and an absence of spelling suggestions. Permission-state
 changes are logged to macOS Console without typed text or message contents.
 
 Spelling and name analysis run on a separate serialized worker, not inside the
-keyboard callback. Orth prepares the spelling service at startup and reports
+keyboard callback. Felix prepares the spelling service at startup and reports
 Preparing spelling engine until it is ready. A disabled keyboard tap is detected
-and re-enabled automatically. Correction-stage timing, cancellations, and skip
+and left stopped until access is granted again or the app is paused and resumed.
+Correction-stage timing, cancellations, and skip
 reasons are logged without word or message contents.
 
 If the menu reports Accessibility permission needed after rebuilding or renaming,
-remove the old app entry from System Settings > Privacy & Security > Accessibility,
-then add `dist/Orth.app` and enable it. Check Input Monitoring if requested.
+quit the app before removing the old entry from System Settings > Privacy & Security > Accessibility,
+then add `dist/Felix.app`, enable it, and relaunch. Check Input Monitoring if requested.
 
-The original internal bundle identifier and preference domain are retained so
-sensitivity and ignored words survive the rename. The app bundle, executable,
-menus, and build/run task names are Orth.
+The app bundle, executable, menus, and build/run task names are Felix.
+The bundle identifier and preference domain are `local.deanmsmith.Felix`.
+The new identity requires Accessibility approval and does not inherit preferences
+from the previous identity.
 
 ## Sensitivity
 
@@ -180,7 +183,7 @@ Replacements, ignored words, technical-text, secure-field, app, and stale-text
 protections.
 
 The initial rules are `thiis = this` and `thi s = this`. The split rule also
-supports `Thi sdog ` to `This dog `: Orth moves the configured stranded `s` only
+supports `Thi sdog ` to `This dog `: Felix moves the configured stranded `s` only
 when the next token is misspelled and the remaining word is valid. Valid next
 words are not altered, and ambiguous competing repairs are skipped. The space
 between tokens must be one ordinary or non-breaking space, never a newline.
@@ -202,12 +205,12 @@ No automatic learning, typing history, or network service is added.
 
 ## macOS Text Replacements
 
-System Settings > Keyboard > Text Replacements takes priority over Orth.
-Before applying any correction, Orth checks the current system replacement
+System Settings > Keyboard > Text Replacements takes priority over Felix.
+Before applying any correction, Felix checks the current system replacement
 dictionary and skips edits overlapping a shortcut, a partially typed multiword
 shortcut, or its expanded text. Matching respects word boundaries, ignores
 capitalisation, and handles non-breaking spaces used by web editors.
-Unrelated text remains eligible for correction. Orth does not expand the
+Unrelated text remains eligible for correction. Felix does not expand the
 shortcuts itself, change macOS settings, or enable substitutions in apps that
 do not support them.
 
@@ -223,7 +226,7 @@ Quit the running app before rebuilding, then run:
 
 ```sh
 zsh scripts/build-app.sh
-open "dist/Orth.app"
+open "dist/Felix.app"
 ```
 
 Equivalent Build and Run tasks are included for VS Code. Run uses the existing
@@ -231,8 +234,7 @@ app bundle; run Build first after source changes.
 
 Local builds are ad-hoc signed. Rebuilding can require removing and re-adding
 the app in Accessibility/Input Monitoring. A development signing identity can
-be supplied with `ORTH_SIGNING_IDENTITY` for more stable attribution. The original
-`MAC_AUTOCORRECT_SIGNING_IDENTITY` variable remains a fallback for existing setups.
+be supplied with `FELIX_SIGNING_IDENTITY` for more stable attribution.
 
 ## Version One Boundaries
 

@@ -1,1 +1,1 @@
-zsh scripts/build-app.sh && open dist/Orth.app
+zsh scripts/build-app.sh && open dist/Felix.app

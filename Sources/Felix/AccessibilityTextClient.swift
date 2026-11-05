@@ -2,7 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon
 
-let orthSyntheticEventTag: Int64 = 0x4F_52_54_48
+let felixSyntheticEventTag: Int64 = 0x46_45_4C_49_58
 
 struct TextSnapshot {
     let element: AXUIElement
@@ -16,11 +16,26 @@ struct TextSnapshot {
 }
 
 @MainActor
+enum TextReplacementTransaction {
+    static func apply(
+        insert: () -> Bool,
+        verifyInsertion: () -> Bool,
+        removeOriginal: () -> Bool,
+        verifyReplacement: () -> Bool
+    ) -> Bool {
+        guard insert(), verifyInsertion() else { return false }
+        guard removeOriginal() else { return false }
+        return verifyReplacement()
+    }
+}
+
+@MainActor
 final class AccessibilityTextClient {
     private let systemWide = AXUIElementCreateSystemWide()
     private let applicationFilter: ApplicationFilter
-    private var preparedProcessID: pid_t?
     private(set) var failureReason: String?
+    var hasAccessibilityAccess = false
+    var hasKeyboardInsertionAccess = false
 
     init(applicationFilter: ApplicationFilter) {
         self.applicationFilter = applicationFilter
@@ -128,74 +143,108 @@ final class AccessibilityTextClient {
         let editRange = NSRange(location: range.location, length: range.length + suffixRange.length)
         let originalText = original + suffix
         let replacementText = replacement + suffix
+        let context = current.text as NSString
+        let localRange = NSRange(
+            location: editRange.location - current.contextStart, length: editRange.length
+        )
+        guard localRange.location >= 0, NSMaxRange(localRange) <= context.length else { return nil }
+        let insertedContext = context.replacingCharacters(
+            in: NSRange(location: localRange.location, length: 0), with: replacementText
+        )
+        let replacementContext = context.replacingCharacters(in: localRange, with: replacementText)
+        let caretLocation = range.location + (replacementText as NSString).length
         failureReason = "Focused app is unavailable"
         guard let application = NSRunningApplication(processIdentifier: expected.processID)
         else { return nil }
-        let isWebEditor = current.selectionMarkers != nil
-        let usesAccessibilityWrite = !isWebEditor
-            && isSettable(kAXSelectedTextAttribute, on: current.element)
         failureReason = "Keyboard insertion permission needed"
-        guard usesAccessibilityWrite || CGPreflightPostEventAccess() else { return nil }
-
-        failureReason = "Editor did not accept the correction selection"
-        guard setSelection(editRange, in: current), waitUntil({
-            guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
-            return CFEqual(focused, current.element)
-                && self.selectedRange(of: focused) == editRange
-                && self.selectedText(of: focused) == originalText
-        })
-        else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: originalText)
-            return nil
-        }
+        guard hasKeyboardInsertionAccess else { return nil }
 
         guard let focused = focusedElement(expectedPID: expected.processID),
               CFEqual(focused, current.element), isSafe(focused, in: application),
-              selectedRange(of: focused) == editRange,
-              self.selectedText(of: focused) == originalText,
+              selectedRange(of: focused) == current.selection,
               string(in: editRange, of: focused) == originalText
-        else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: originalText)
+        else { return nil }
+
+        failureReason = "Editor did not confirm the correction caret"
+        guard setCaret(at: range.location, in: current), waitUntil({
+            self.matches(current, text: current.text, caret: range.location)
+        }) else {
+            restoreCaret(afterFailureIn: current, at: range.location)
             return nil
         }
 
-        failureReason = "Editor did not accept the replacement"
-        let didInsert: Bool
-        if usesAccessibilityWrite {
-            didInsert = AXUIElementSetAttributeValue(
-                current.element, kAXSelectedTextAttribute as CFString, replacementText as CFString
-            ) == .success
-        } else {
-            didInsert = insertUsingKeyboard(replacementText, processID: expected.processID)
-        }
-        guard didInsert else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: originalText)
+        failureReason = "Editor did not confirm inserted text; original text was kept"
+        guard TextReplacementTransaction.apply(
+            insert: {
+                self.insertUsingKeyboard(replacementText, processID: expected.processID)
+            },
+            verifyInsertion: {
+                self.waitUntil {
+                    self.matches(current, text: insertedContext, caret: caretLocation)
+                }
+            },
+            removeOriginal: {
+                guard self.matches(current, text: insertedContext, caret: caretLocation)
+                else { return false }
+                self.failureReason = "Editor did not confirm removal; replacement text was kept"
+                return self.removeUsingKeyboard(originalText.count, processID: expected.processID)
+            },
+            verifyReplacement: {
+                self.waitUntil {
+                    self.matches(current, text: replacementContext, caret: caretLocation)
+                }
+            }
+        ) else {
+            restoreCaret(afterFailureIn: current, at: range.location)
             return nil
         }
 
         let replacementLength = (replacement as NSString).length
         let replacementRange = NSRange(location: range.location, length: replacementLength)
-        let insertedRange = NSRange(
-            location: range.location, length: (replacementText as NSString).length
-        )
-        let caretRange = NSRange(location: NSMaxRange(insertedRange), length: 0)
-        guard waitUntil({
-            guard let focused = self.focusedElement(expectedPID: expected.processID) else { return false }
-            return CFEqual(focused, current.element)
-                && self.string(in: insertedRange, of: focused) == replacementText
-                && self.selectedRange(of: focused) == caretRange
-        })
-        else {
-            restoreSelection(afterFailureIn: current, selected: editRange, original: originalText)
-            return nil
-        }
-
         guard let updated = snapshot(expectedPID: expected.processID) else { return nil }
 
         return (
             snapshot: updated,
             bounds: bounds(of: replacementRange, in: updated)
         )
+    }
+
+    private func matches(_ snapshot: TextSnapshot, text: String, caret: Int) -> Bool {
+        guard let focused = focusedElement(expectedPID: snapshot.processID),
+              CFEqual(focused, snapshot.element),
+              selectedRange(of: focused) == NSRange(location: caret, length: 0)
+        else { return false }
+        return string(
+            in: NSRange(location: snapshot.contextStart, length: (text as NSString).length),
+            of: focused
+        ) == text
+    }
+
+    private func setCaret(at location: Int, in snapshot: TextSnapshot) -> Bool {
+        guard location >= 0, location <= snapshot.selection.location,
+              let focused = focusedElement(expectedPID: snapshot.processID),
+              CFEqual(focused, snapshot.element)
+        else { return false }
+        if let markers = snapshot.selectionMarkers {
+            guard let caret = marker(
+                before: AXTextMarkerRangeCopyEndMarker(markers),
+                count: snapshot.selection.location - location, of: focused
+            ) else { return false }
+            let selection = AXTextMarkerRangeCreate(nil, caret, caret)
+            return AXUIElementSetAttributeValue(
+                focused, "AXSelectedTextMarkerRange" as CFString, selection
+            ) == .success
+        }
+        var range = CFRange(location: location, length: 0)
+        guard let selection = AXValueCreate(.cfRange, &range) else { return false }
+        return AXUIElementSetAttributeValue(
+            focused, kAXSelectedTextRangeAttribute as CFString, selection
+        ) == .success
+    }
+
+    private func restoreCaret(afterFailureIn snapshot: TextSnapshot, at location: Int) {
+        guard matches(snapshot, text: snapshot.text, caret: location) else { return }
+        _ = setCaret(at: snapshot.selection.location, in: snapshot)
     }
 
     private func bounds(of range: NSRange, in snapshot: TextSnapshot) -> CGRect? {
@@ -211,6 +260,7 @@ final class AccessibilityTextClient {
         }
 
         // Chromium can expose text-marker geometry even when numeric bounds are empty.
+        // Numeric paragraph-end offsets can include the next paragraph in Chromium.
         let suffixLength = snapshot.selection.location - NSMaxRange(range)
         guard range.length > 0, (0...4).contains(suffixLength),
               selectedRange(of: focused) == snapshot.selection,
@@ -255,12 +305,11 @@ final class AccessibilityTextClient {
     }
 
     func prepare(_ application: NSRunningApplication) {
-        guard AXIsProcessTrusted(), preparedProcessID != application.processIdentifier else { return }
-        preparedProcessID = application.processIdentifier
-        guard isChromium(application) else { return }
+        guard hasAccessibilityAccess, isChromium(application) else { return }
 
         let element = AXUIElementCreateApplication(application.processIdentifier)
         AXUIElementSetMessagingTimeout(element, 0.04)
+        guard (attribute("AXManualAccessibility", of: element) as? Bool) != true else { return }
         _ = AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
     }
 
@@ -284,7 +333,7 @@ final class AccessibilityTextClient {
     }
 
     private func insertUsingKeyboard(_ text: String, processID: pid_t) -> Bool {
-        guard !IsSecureEventInputEnabled(), CGPreflightPostEventAccess(),
+        guard !IsSecureEventInputEnabled(), hasKeyboardInsertionAccess,
               NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
               let source = CGEventSource(stateID: .privateState),
               let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
@@ -296,16 +345,38 @@ final class AccessibilityTextClient {
             guard let pointer = buffer.baseAddress else { return false }
             for event in [keyDown, keyUp] {
                 event.flags = []
-                event.setIntegerValueField(.eventSourceUserData, value: orthSyntheticEventTag)
+                event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
                 event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: pointer)
-                event.post(tap: .cgAnnotatedSessionEventTap)
+                event.postToPid(processID)
             }
             return true
         }
     }
 
+    private func removeUsingKeyboard(_ count: Int, processID: pid_t) -> Bool {
+        guard count > 0, !IsSecureEventInputEnabled(), hasKeyboardInsertionAccess,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
+              let source = CGEventSource(stateID: .privateState),
+              let keyDown = CGEvent(
+                  keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ForwardDelete), keyDown: true
+              ),
+              let keyUp = CGEvent(
+                  keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ForwardDelete), keyDown: false
+              )
+        else { return false }
+        for event in [keyDown, keyUp] {
+            event.flags = []
+            event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
+        }
+        for _ in 0..<count {
+            keyDown.postToPid(processID)
+            keyUp.postToPid(processID)
+        }
+        return true
+    }
+
     private func focusedElement(expectedPID: pid_t) -> AXUIElement? {
-        guard !IsSecureEventInputEnabled(), AXIsProcessTrusted(),
+        guard !IsSecureEventInputEnabled(), hasAccessibilityAccess,
               NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID
         else { return nil }
 
@@ -430,46 +501,11 @@ final class AccessibilityTextClient {
         return NSRange(location: range.location, length: range.length)
     }
 
-    private func selectedText(of element: AXUIElement) -> String? {
-        if let markers = selectedTextMarkers(of: element),
-           let text = parameterizedAttribute(
-               "AXStringForTextMarkerRange", value: markers, of: element
-           ) as? String {
-            return text
-        }
-        return attribute(kAXSelectedTextAttribute, of: element) as? String
-    }
-
     private func selectedTextMarkers(of element: AXUIElement) -> AXTextMarkerRange? {
         guard let value = attribute("AXSelectedTextMarkerRange", of: element),
               CFGetTypeID(value) == AXTextMarkerRangeGetTypeID()
         else { return nil }
         return (value as! AXTextMarkerRange)
-    }
-
-    private func setSelection(_ range: NSRange, in snapshot: TextSnapshot) -> Bool {
-        // Numeric paragraph-end offsets can include the next paragraph in Chromium.
-        if let markers = snapshot.selectionMarkers {
-            let distance = snapshot.selection.location - NSMaxRange(range)
-            guard isSettable("AXSelectedTextMarkerRange", on: snapshot.element),
-                  distance >= 0,
-                  let end = marker(
-                      before: AXTextMarkerRangeCopyEndMarker(markers),
-                      count: distance, of: snapshot.element
-                  ),
-                  let start = marker(before: end, count: range.length, of: snapshot.element)
-            else { return false }
-            let selection = AXTextMarkerRangeCreate(nil, start, end)
-            return AXUIElementSetAttributeValue(
-                snapshot.element, "AXSelectedTextMarkerRange" as CFString, selection
-            ) == .success
-        }
-
-        var value = CFRange(location: range.location, length: range.length)
-        guard let selection = AXValueCreate(.cfRange, &value) else { return false }
-        return AXUIElementSetAttributeValue(
-            snapshot.element, kAXSelectedTextRangeAttribute as CFString, selection
-        ) == .success
     }
 
     private func string(in range: NSRange, of element: AXUIElement) -> String? {
@@ -500,23 +536,5 @@ final class AccessibilityTextClient {
               range.length <= source.length - range.location
         else { return nil }
         return source.substring(with: range)
-    }
-
-    private func restoreSelection(
-        afterFailureIn snapshot: TextSnapshot, selected: NSRange, original: String
-    ) {
-        guard let focused = focusedElement(expectedPID: snapshot.processID),
-              CFEqual(focused, snapshot.element), selectedRange(of: focused) == selected,
-              string(in: selected, of: focused) == original
-        else { return }
-        guard setSelection(snapshot.selection, in: snapshot), waitUntil({
-            guard let current = self.focusedElement(expectedPID: snapshot.processID) else { return false }
-            return CFEqual(current, snapshot.element)
-                && self.selectedRange(of: current) == snapshot.selection
-        })
-        else {
-            failureReason = "Editor did not restore the original caret after rejecting the correction"
-            return
-        }
     }
 }
