@@ -131,8 +131,8 @@ actor CorrectionPolicy {
               word.unicodeScalars.allSatisfy({
                   (97...122).contains($0.value) || (65...90).contains($0.value)
               }),
-              word == lowercase || (profile.fixesCapitals && hasDoubleInitialCapitals)
-                || (sensitivity == .aggressive && word == titlecase),
+              word == lowercase || word == titlecase
+                || (profile.fixesCapitals && hasDoubleInitialCapitals),
               !ignoredWords.contains(lowercase),
               !token.hasPrefix("."), !token.hasPrefix(":")
         else { return nil }
@@ -163,9 +163,12 @@ actor CorrectionPolicy {
         if spelling.location == NSNotFound, hasDoubleInitialCapitals, !Task.isCancelled {
             return CorrectionCandidate(original: word, replacement: titlecase, range: range)
         }
-          guard spelling.location != NSNotFound, !Task.isCancelled,
-              !isProperName(in: text, range: range), !Task.isCancelled
-          else { return nil }
+        // Initial capitalization alone must not make a typo look like a proper name.
+        let spellingText = word == titlecase
+            ? source.replacingCharacters(in: range, with: lowercase) : text
+        guard spelling.location != NSNotFound, !Task.isCancelled,
+              !isProperName(in: spellingText, range: range), !Task.isCancelled
+        else { return nil }
 
         if profile.fixesRepeatedLetters,
            let replacement = repeatedLetterCorrection(for: word) {
@@ -174,14 +177,14 @@ actor CorrectionPolicy {
 
         let automatic = spellChecker.correction(
             forWordRange: range,
-            in: text,
+            in: spellingText,
             language: language,
             inSpellDocumentWithTag: documentTag
         )
         var replacement = automatic.flatMap { normalizedReplacement($0, for: word) }
         if replacement == nil, sensitivity != .conservative {
             let guesses = spellChecker.guesses(
-                forWordRange: range, in: text, language: language,
+                forWordRange: range, in: spellingText, language: language,
                 inSpellDocumentWithTag: documentTag
             ) ?? []
             for guess in guesses {

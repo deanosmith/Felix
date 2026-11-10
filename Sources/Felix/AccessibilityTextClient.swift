@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import OSLog
 
 let felixSyntheticEventTag: Int64 = 0x46_45_4C_49_58
 
@@ -33,6 +34,8 @@ enum TextReplacementTransaction {
 final class AccessibilityTextClient {
     private let systemWide = AXUIElementCreateSystemWide()
     private let applicationFilter: ApplicationFilter
+    private let accessibilityLog = Logger(subsystem: "local.deanmsmith.Felix", category: "Accessibility")
+    private var accessibilityRequests: [pid_t: TimeInterval] = [:]
     private(set) var failureReason: String?
     var hasAccessibilityAccess = false
     var hasKeyboardInsertionAccess = false
@@ -75,6 +78,13 @@ final class AccessibilityTextClient {
         guard let element = focusedElement(expectedPID: expectedPID) else { return nil }
         failureReason = "Focused field is protected or unsupported"
         guard isSafe(element, in: application) else { return nil }
+        if application.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.vscode") == true,
+           (attribute("AXDOMClassList", of: element) as? [String] ?? []).contains("native-edit-context"),
+           (attribute(kAXDescriptionAttribute, of: element) as? String ?? "")
+            .lowercased().contains("editor is not accessible") {
+            failureReason = "VS Code chat needs Editor: Accessibility Support set to On"
+            return nil
+        }
         let isWebEditor = isChromium(application) || isWebContent(element)
         let selectionMarkers = isWebEditor ? selectedTextMarkers(of: element) : nil
         failureReason = isWebEditor
@@ -310,7 +320,19 @@ final class AccessibilityTextClient {
         let element = AXUIElementCreateApplication(application.processIdentifier)
         AXUIElementSetMessagingTimeout(element, 0.04)
         guard (attribute("AXManualAccessibility", of: element) as? Bool) != true else { return }
-        _ = AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        let now = ProcessInfo.processInfo.systemUptime
+        // Electron restarts its two-second activation delay on every accessibility request.
+        if let requestedAt = accessibilityRequests[application.processIdentifier],
+           now - requestedAt < 3 {
+            return
+        }
+        accessibilityRequests[application.processIdentifier] = now
+        let result = AXUIElementSetAttributeValue(
+            element, "AXManualAccessibility" as CFString, kCFBooleanTrue
+        )
+        if result != .success {
+            accessibilityLog.error("Unable to enable browser accessibility: \(result.rawValue)")
+        }
     }
 
     private func isChromium(_ application: NSRunningApplication?) -> Bool {
@@ -428,11 +450,15 @@ final class AccessibilityTextClient {
         ].contains(where: hints.contains)
     }
 
+    static func hasChatInputMetadata(classes: [String]) -> Bool {
+        return classes.contains("chat-input-container") || classes.contains("chat-editor-container")
+    }
+
     private func isChatInput(_ element: AXUIElement) -> Bool {
         var current = element
-        for _ in 0..<8 {
+        for _ in 0..<16 {
             let classes = attribute("AXDOMClassList", of: current) as? [String] ?? []
-            if classes.contains("chat-input-container") { return true }
+            if Self.hasChatInputMetadata(classes: classes) { return true }
             guard let parent = attribute(kAXParentAttribute, of: current),
                   CFGetTypeID(parent) == AXUIElementGetTypeID()
             else { return false }

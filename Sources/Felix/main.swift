@@ -29,8 +29,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSColor(srgbRed: components[0], green: components[1], blue: components[2], alpha: 1)
     }()
 
-    private var showingCorrection: Bool { !correctionFeedback.isEmpty }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu()
@@ -114,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("Quit", action: #selector(quit), symbol: "power", to: menu)
         item.menu = menu
         statusItem = item
+        updateStatusIcon()
 
         engine.onChange = { [weak self] in self?.updateMenu() }
         engine.onCorrection = { [weak self] rectangle in self?.showCorrection(at: rectangle) }
@@ -202,6 +201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
+    private func updateStatusIcon() {
+        statusItem?.button?.image = wrenchImage(filled: !engine.isPaused)
+        statusItem?.button?.contentTintColor = engine.isPaused ? .secondaryLabelColor : nil
+    }
+
     private func updateMenu() {
         status.title = engine.status
         counter.title = "Corrections this session: \(engine.correctionCount)"
@@ -225,11 +229,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             option.state = (option.representedObject as? String) == engine.applicationFilter.mode.rawValue ? .on : .off
         }
         ignore.isEnabled = engine.lastCorrection != nil
-        statusItem?.button?.image = showingCorrection
-            ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Felix")
-            : wrenchImage(filled: !engine.isPaused)
-        statusItem?.button?.contentTintColor = showingCorrection ? .systemGreen
-            : (engine.isPaused ? .secondaryLabelColor : nil)
         statusItem?.button?.toolTip = "Felix: \(engine.status) (\(engine.sensitivity.title))"
     }
 
@@ -295,14 +294,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } catch { return }
             guard let self else { return }
             correctionFeedback.removeValue(forKey: identifier)?.panel?.orderOut(nil)
-            updateMenu()
         }
         correctionFeedback[identifier] = CorrectionFeedback(panel: feedbackPanel, task: task)
-        updateMenu()
     }
 
     @objc private func togglePaused() {
         engine.togglePaused()
+        updateStatusIcon()
     }
 
     @objc private func setSensitivity(_ sender: NSMenuItem) {

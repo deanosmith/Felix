@@ -15,13 +15,6 @@
             "command": "open",
             "args": ["${workspaceFolder}/dist/Felix.app"],
             "problemMatcher": []
-        },
-        {
-            "label": "Test Text Replacements",
-            "type": "process",
-            "command": "zsh",
-            "args": ["${workspaceFolder}/scripts/test-text-replacements.sh"],
-            "problemMatcher": []
         }
     ]
 }
