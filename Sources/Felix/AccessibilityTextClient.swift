@@ -16,6 +16,17 @@ struct TextSnapshot {
     var caretOffset: Int { selection.location - contextStart }
 }
 
+struct OpaqueTextTarget {
+    let element: AXUIElement
+    let processID: pid_t
+}
+
+enum FocusedFieldState {
+    case readable(TextSnapshot)
+    case opaque(OpaqueTextTarget)
+    case unavailable
+}
+
 enum TextReplacementResult {
     case unchanged
     case unconfirmed
@@ -43,6 +54,7 @@ final class AccessibilityTextClient {
     private let applicationFilter: ApplicationFilter
     private let accessibilityLog = Logger(subsystem: "local.deanmsmith.Felix", category: "Accessibility")
     private var accessibilityRequests: [pid_t: TimeInterval] = [:]
+    private var preparedProcesses: Set<pid_t> = []
     private var pendingSelections: [PendingSelection] = []
     private var replacementIsInFlight = false
     private(set) var failureReason: String?
@@ -54,85 +66,101 @@ final class AccessibilityTextClient {
     }
 
     func allows(_ application: NSRunningApplication) -> Bool {
-        guard let identifier = application.bundleIdentifier?.lowercased(),
-              application.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        else { return false }
-
-        let excluded = [
-            "com.apple.dt.xcode", "com.apple.terminal", "com.apple.keychainaccess",
-            "com.apple.passwords", "com.googlecode.iterm2", "dev.warp.warp-stable",
-            "net.kovidgoyal.kitty", "org.alacritty", "io.alacritty", "com.mitchellh.ghostty",
-            "org.vim.macvim", "com.sublimetext.3", "com.sublimetext.4", "dev.zed.zed",
-            "com.barebones.bbedit", "com.google.android.studio", "com.exafunction.windsurf",
-            "com.todesktop.230313mzl4w4u92", "com.microsoft.rdc.macos",
-            "com.microsoft.rdc.mac", "com.microsoft.windowsapp", "com.realvnc.vncviewer"
-        ]
-        let prefixes = [
-            "com.jetbrains.", "com.agilebits.",
-            "com.1password.", "com.cursor.", "com.parallels.", "com.citrix."
-        ]
-        return applicationFilter.allows(identifier)
-            && !excluded.contains(identifier) && !prefixes.contains(where: identifier.hasPrefix)
+        application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            && applicationFilter.allows(application.bundleIdentifier)
     }
 
-    func snapshot(expectedPID: pid_t) -> TextSnapshot? {
-        guard recoverPendingSelection() else { return nil }
-        failureReason = "Focused app is unavailable or protected"
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              application.processIdentifier == expectedPID, allows(application)
-        else { return nil }
-        prepare(application)
+    func snapshot(expectedPID: pid_t? = nil) -> TextSnapshot? {
+        guard case let .readable(snapshot) = fieldState(expectedPID: expectedPID) else { return nil }
+        return snapshot
+    }
 
+    func fieldState(expectedPID: pid_t? = nil) -> FocusedFieldState {
+        guard recoverPendingSelection() else { return .unavailable }
+        if let frontmost = NSWorkspace.shared.frontmostApplication, allows(frontmost) {
+            prepare(frontmost)
+        }
         failureReason = "Focused text field is unavailable"
-        guard let element = focusedElement(expectedPID: expectedPID) else { return nil }
+        guard let target = focusedTarget(expectedPID: expectedPID) else { return .unavailable }
+        prepare(target.application)
+
+        let element = target.element
         failureReason = "Focused field is protected or unsupported"
-        guard isSafe(element, in: application) else { return nil }
-        if application.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.vscode") == true,
-           (attribute("AXDOMClassList", of: element) as? [String] ?? []).contains("native-edit-context"),
-           (attribute(kAXDescriptionAttribute, of: element) as? String ?? "")
-            .lowercased().contains("editor is not accessible") {
-            failureReason = "VS Code chat needs Editor: Accessibility Support set to On"
-            return nil
+        guard isSafe(element) else { return .unavailable }
+
+        let classes = attribute("AXDOMClassList", of: element) as? [String] ?? []
+        if classes.contains("native-edit-context") {
+            let count = (attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber)?
+                .intValue ?? 0
+            if count == 0 {
+                failureReason = nil
+                return .opaque(OpaqueTextTarget(element: element, processID: target.processID))
+            }
+        }
+
+        guard let selection = selectedRange(of: element) else {
+            failureReason = nil
+            return .opaque(OpaqueTextTarget(element: element, processID: target.processID))
         }
         failureReason = "Focused field does not expose a collapsed caret"
-        guard let selection = selectedRange(of: element),
-              selection.location >= 0, selection.length == 0
-        else { return nil }
-        let isWebEditor = isChromium(application) || isWebContent(element)
-        let selectionMarkers = isWebEditor ? selectedTextMarkers(of: element) : nil
+        guard selection.location >= 0, selection.length == 0
+        else { return .unavailable }
+
+        let role = attribute(kAXRoleAttribute, of: element) as? String ?? ""
+        let isWebEditor = isChromium(target.application) || isWebContent(element)
+        let selectionMarkers: AXTextMarkerRange?
+        let hasWritableCaret: Bool
+        if isWebEditor {
+            if let markers = selectedTextMarkers(of: element),
+               isSettable("AXSelectedTextMarkerRange", on: element) {
+                selectionMarkers = markers
+                hasWritableCaret = true
+            } else if role == kAXTextFieldRole,
+                      isSettable(kAXSelectedTextRangeAttribute, on: element) {
+                selectionMarkers = nil
+                hasWritableCaret = true
+            } else {
+                selectionMarkers = nil
+                hasWritableCaret = false
+            }
+        } else {
+            selectionMarkers = nil
+            hasWritableCaret = isSettable(kAXSelectedTextRangeAttribute, on: element)
+        }
         failureReason = "Focused field does not expose a writable caret"
-        guard isWebEditor
-            ? selectionMarkers != nil && isSettable("AXSelectedTextMarkerRange", on: element)
-            : isSettable(kAXSelectedTextRangeAttribute, on: element)
-        else { return nil }
+        guard hasWritableCaret else {
+            failureReason = nil
+            return .opaque(OpaqueTextTarget(element: element, processID: target.processID))
+        }
 
         let characterCount = (attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber)?
             .intValue ?? selection.location
-        guard characterCount >= selection.location else { return nil }
-
         let start = max(0, selection.location - 1_024)
-        let length = selection.location - start + min(128, characterCount - selection.location)
+        let length = selection.location - start + min(128, max(0, characterCount - selection.location))
         let contextRange = NSRange(location: start, length: length)
         let prefixRange = NSRange(location: start, length: selection.location - start)
         failureReason = "Focused field does not expose readable text"
         // Chromium can report a character count larger than its addressable text.
         guard let text = string(in: contextRange, of: element)
             ?? string(in: prefixRange, of: element)
-        else { return nil }
+        else {
+            failureReason = nil
+            return .opaque(OpaqueTextTarget(element: element, processID: target.processID))
+        }
         guard selectedRange(of: element) == selection else {
             failureReason = "Editor changed its caret while reading text"
-            return nil
+            return .unavailable
         }
 
         failureReason = nil
-        return TextSnapshot(
+        return .readable(TextSnapshot(
             element: element,
-            processID: expectedPID,
+            processID: target.processID,
             selection: selection,
             selectionMarkers: selectionMarkers,
             contextStart: start,
             text: text
-        )
+        ))
     }
 
     func recoverPendingSelection() -> Bool {
@@ -140,12 +168,16 @@ final class AccessibilityTextClient {
         pendingSelections.removeAll {
             NSRunningApplication(processIdentifier: $0.snapshot.processID)?.isTerminated != false
         }
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              pendingSelections.contains(where: { $0.snapshot.processID == application.processIdentifier })
-        else { return true }
+        guard let currentTarget = focusedTarget() else {
+            let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            guard let frontPID,
+                  pendingSelections.contains(where: { $0.snapshot.processID == frontPID })
+            else { return true }
+            failureReason = "Felix could not restore its selection; move the caret before typing"
+            return false
+        }
         failureReason = "Felix could not restore its selection; move the caret before typing"
-        guard let focused = focusedElement(expectedPID: application.processIdentifier)
-        else { return false }
+        let focused = currentTarget.element
         guard let index = pendingSelections.firstIndex(where: { CFEqual($0.snapshot.element, focused) })
         else { return true }
         let pending = pendingSelections[index]
@@ -227,8 +259,7 @@ final class AccessibilityTextClient {
 
     func selection(in expected: TextSnapshot) -> TextSelectionResult {
         failureReason = "Correction focus changed"
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              application.processIdentifier == expected.processID, allows(application)
+        guard isTargetApplicationAllowed(processID: expected.processID)
         else { return .changed }
         failureReason = "Editor caret is temporarily unavailable"
         guard let focused = focusedElement(expectedPID: expected.processID) else { return .unavailable }
@@ -243,6 +274,79 @@ final class AccessibilityTextClient {
         }
         failureReason = nil
         return .caret(range.location)
+    }
+
+    func matchesOpaqueTarget(_ target: OpaqueTextTarget) -> Bool {
+        failureReason = "Correction focus changed"
+        guard let current = focusedTarget(expectedPID: target.processID),
+              CFEqual(current.element, target.element),
+              isSafe(current.element)
+        else { return false }
+        if let range = selectedRange(of: current.element), range.length > 0 {
+            failureReason = "Correction selection changed"
+            return false
+        }
+        failureReason = nil
+        return true
+    }
+
+    func replaceOpaque(
+        deleteCount: Int,
+        replacement: String,
+        in target: OpaqueTextTarget
+    ) -> Bool {
+        guard !replacementIsInFlight else {
+            failureReason = "Previous replacement is still being confirmed"
+            return false
+        }
+        replacementIsInFlight = true
+        defer { replacementIsInFlight = false }
+        guard deleteCount > 0, !IsSecureEventInputEnabled(),
+              let current = focusedTarget(expectedPID: target.processID),
+              CFEqual(current.element, target.element),
+              isSafe(current.element)
+        else {
+            failureReason = "Text or focus changed before correction"
+            return false
+        }
+        if let range = selectedRange(of: current.element), range.length > 0 {
+            failureReason = "Focused field has an active selection"
+            return false
+        }
+        guard let insertion = keyboardInsertion(replacement),
+              let source = CGEventSource(stateID: .privateState)
+        else { return false }
+
+        var backspaces: [(CGEvent, CGEvent)] = []
+        backspaces.reserveCapacity(deleteCount)
+        for _ in 0..<deleteCount {
+            guard let down = CGEvent(
+                keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: true
+            ), let up = CGEvent(
+                keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Delete), keyDown: false
+            ) else {
+                failureReason = "Keyboard deletion event could not be created"
+                return false
+            }
+            for event in [down, up] {
+                event.flags = []
+                event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
+            }
+            backspaces.append((down, up))
+        }
+
+        guard !IsSecureEventInputEnabled() else {
+            failureReason = "Secure input active - suspended"
+            return false
+        }
+        for (down, up) in backspaces {
+            down.postToPid(target.processID)
+            up.postToPid(target.processID)
+        }
+        insertion.0.postToPid(target.processID)
+        insertion.1.postToPid(target.processID)
+        failureReason = nil
+        return true
     }
 
     func replace(
@@ -277,7 +381,7 @@ final class AccessibilityTextClient {
         let suffix = context.substring(with: suffixRange)
         guard suffix.unicodeScalars.allSatisfy({
                   CharacterSet.whitespaces.contains($0)
-                      || CharacterSet(charactersIn: ".!?,;:").contains($0)
+                      || CharacterSet(charactersIn: ".!?,;:\u{2026}").contains($0)
               })
         else { return .unchanged }
 
@@ -289,14 +393,14 @@ final class AccessibilityTextClient {
         )
         let caretLocation = range.location + (replacementText as NSString).length
         failureReason = "Focused app is unavailable"
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              application.processIdentifier == expected.processID, allows(application)
+        guard !IsSecureEventInputEnabled(),
+              let currentTarget = focusedTarget(expectedPID: expected.processID)
         else { return .unchanged }
+        let application = currentTarget.application
+        let focused = currentTarget.element
 
         failureReason = "Text or focus changed before correction"
-        guard !IsSecureEventInputEnabled(),
-              let focused = focusedElement(expectedPID: expected.processID),
-              CFEqual(focused, expected.element), isSafe(focused, in: application)
+        guard CFEqual(focused, expected.element), isSafe(focused)
         else { return .unchanged }
 
         let markers: AXTextMarkerRange?
@@ -317,9 +421,11 @@ final class AccessibilityTextClient {
         } else {
             markers = nil
         }
+        let isWebEditor = isChromium(application) || isWebContent(focused)
         let usesAtomicOperation = markers != nil
             && supportsAtomicReplacement(on: focused, in: application)
-        let usesSelectedText = markers == nil && isSettable(kAXSelectedTextAttribute, on: focused)
+        let usesSelectedText = !isWebEditor && markers == nil
+            && isSettable(kAXSelectedTextAttribute, on: focused)
         let insertion = usesAtomicOperation || usesSelectedText ? nil : keyboardInsertion(replacementText)
         guard usesAtomicOperation || usesSelectedText || insertion != nil else { return .unchanged }
 
@@ -352,7 +458,14 @@ final class AccessibilityTextClient {
                 ), replacementContext: replacementContext, caret: caretLocation
             ))
             guard setSelection(editRange, markers: markers, on: focused),
-                  await waitUntil({ self.selectedRange(of: focused) == editRange })
+                  await waitUntil({
+                    guard let target = self.focusedElement(expectedPID: expected.processID),
+                          CFEqual(target, focused),
+                          self.string(in: editRange, of: target) == originalText
+                    else { return false }
+                    // Confirm selection last so the write can follow without more accessibility reads.
+                    return self.selectedRange(of: target) == editRange
+                  })
             else {
                 let reported = selectedRange(of: focused)
                     .map { "\($0.location):\($0.length)" } ?? "unavailable"
@@ -362,10 +475,7 @@ final class AccessibilityTextClient {
                 failureReason = "Editor selection not confirmed: requested \(editRange.location):\(editRange.length), reported \(reported), selected length \(selectedLength)"
                 return .unconfirmed
             }
-            guard !Task.isCancelled, !IsSecureEventInputEnabled(),
-                  let target = focusedElement(expectedPID: expected.processID),
-                  CFEqual(target, focused), selectedRange(of: target) == editRange,
-                  string(in: editRange, of: target) == originalText
+            guard !Task.isCancelled, !IsSecureEventInputEnabled()
             else {
                 _ = recoverPendingSelection()
                 return .unconfirmed
@@ -468,7 +578,7 @@ final class AccessibilityTextClient {
         on element: AXUIElement, in application: NSRunningApplication
     ) -> Bool {
         // Older WebKit can interpret an unknown replacement operation as selection.
-        if !isChromium(application) {
+        if !isChromium(application), attribute("ChromeAXNodeId", of: element) == nil {
             guard #available(macOS 15.2, *) else { return false }
         }
         var attributes: CFArray?
@@ -543,23 +653,35 @@ final class AccessibilityTextClient {
         return rectangle
     }
 
-    func prepare(_ application: NSRunningApplication) {
-        guard hasAccessibilityAccess, isChromium(application) else { return }
+    func prepare(_ application: NSRunningApplication, force: Bool = false) {
+        guard hasAccessibilityAccess else { return }
+        preparedProcesses = preparedProcesses.filter {
+            NSRunningApplication(processIdentifier: $0)?.isTerminated == false
+        }
+        let pid = application.processIdentifier
+        if !force, preparedProcesses.contains(pid) { return }
 
-        let element = AXUIElementCreateApplication(application.processIdentifier)
+        let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, 0.04)
-        guard (attribute("AXManualAccessibility", of: element) as? Bool) != true else { return }
+        guard isChromium(application) || isSettable("AXManualAccessibility", on: element)
+        else { return }
+        if (attribute("AXManualAccessibility", of: element) as? Bool) == true {
+            preparedProcesses.insert(pid)
+            return
+        }
         let now = ProcessInfo.processInfo.systemUptime
         // Electron restarts its two-second activation delay on every accessibility request.
-        if let requestedAt = accessibilityRequests[application.processIdentifier],
+        if let requestedAt = accessibilityRequests[pid],
            now - requestedAt < 3 {
             return
         }
-        accessibilityRequests[application.processIdentifier] = now
+        accessibilityRequests[pid] = now
         let result = AXUIElementSetAttributeValue(
             element, "AXManualAccessibility" as CFString, kCFBooleanTrue
         )
-        if result != .success {
+        if result == .success {
+            preparedProcesses.insert(pid)
+        } else if result != .attributeUnsupported {
             accessibilityLog.error("Unable to enable browser accessibility: \(result.rawValue)")
         }
     }
@@ -585,79 +707,104 @@ final class AccessibilityTextClient {
         return false
     }
 
-    private func focusedElement(expectedPID: pid_t) -> AXUIElement? {
-        guard !IsSecureEventInputEnabled(), hasAccessibilityAccess,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID
-        else { return nil }
+    private func isTargetApplicationAllowed(processID: pid_t) -> Bool {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        if frontmost?.processIdentifier == processID {
+            return frontmost.map(allows) == true
+        }
+        guard let owner = NSRunningApplication(processIdentifier: processID),
+              !owner.isTerminated
+        else { return false }
+        if owner.activationPolicy == .prohibited {
+            return frontmost.map(allows) == true
+        }
+        return owner.activationPolicy == .accessory && allows(owner)
+    }
 
-        let application = AXUIElementCreateApplication(expectedPID)
-        AXUIElementSetMessagingTimeout(application, 0.04)
-        guard let value = attribute(kAXFocusedUIElementAttribute, of: application)
-            ?? attribute(kAXFocusedUIElementAttribute, of: systemWide),
+    private func focusedTarget(
+        expectedPID: pid_t? = nil
+    ) -> (element: AXUIElement, application: NSRunningApplication, processID: pid_t)? {
+        guard !IsSecureEventInputEnabled(), hasAccessibilityAccess else { return nil }
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let appElement = frontmost.map { app -> AXUIElement in
+            let element = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, 0.04)
+            return element
+        }
+        guard let value = attribute(kAXFocusedUIElementAttribute, of: systemWide)
+            ?? appElement.flatMap({ attribute(kAXFocusedUIElementAttribute, of: $0) }),
               CFGetTypeID(value) == AXUIElementGetTypeID()
         else { return nil }
 
         let element = value as! AXUIElement
         AXUIElementSetMessagingTimeout(element, 0.04)
         var processID: pid_t = 0
-        guard AXUIElementGetPid(element, &processID) == .success, processID == expectedPID
+        guard AXUIElementGetPid(element, &processID) == .success,
+              let owner = NSRunningApplication(processIdentifier: processID),
+              !owner.isTerminated
         else { return nil }
-        return element
+        if let expectedPID, processID != expectedPID {
+            guard frontmost?.processIdentifier == expectedPID,
+                  owner.activationPolicy == .prohibited
+            else { return nil }
+        }
+        guard isTargetApplicationAllowed(processID: processID) else { return nil }
+        let application = owner.activationPolicy == .prohibited ? (frontmost ?? owner) : owner
+        return (element, application, processID)
     }
 
-    private func isSafe(_ element: AXUIElement, in application: NSRunningApplication) -> Bool {
-        let isVSCode = application.bundleIdentifier?.lowercased().hasPrefix("com.microsoft.vscode") == true
-        let isChat = isVSCode && isChatInput(element)
+    private func focusedElement(expectedPID: pid_t) -> AXUIElement? {
+        focusedTarget(expectedPID: expectedPID)?.element
+    }
+
+    private func isSafe(_ element: AXUIElement) -> Bool {
         guard let role = attribute(kAXRoleAttribute, of: element) as? String,
-              [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole].contains(role),
+              isEditable(element, role: role),
               (attribute(kAXEnabledAttribute, of: element) as? Bool) != false,
-              (attribute("AXProtectedContent", of: element) as? Bool) != true,
-              (!isVSCode || isChat), (isChat || !hasTechnicalDocument(element))
+              (attribute("AXReadOnly", of: element) as? Bool) != true,
+              (attribute("AXProtectedContent", of: element) as? Bool) != true
         else { return false }
 
         let subrole = (attribute(kAXSubroleAttribute, of: element) as? String ?? "").lowercased()
-        guard !subrole.contains("secure"), !subrole.contains("search") else { return false }
+        guard !subrole.contains("secure") else { return false }
 
-        let names = [
-            kAXIdentifierAttribute, kAXDescriptionAttribute, kAXTitleAttribute,
-            kAXRoleDescriptionAttribute, "AXPlaceholderValue", "AXDOMIdentifier"
-        ]
+        let usesFullFieldMetadata = role == kAXTextFieldRole || role == kAXComboBoxRole
+        let names = usesFullFieldMetadata
+            ? [
+                kAXIdentifierAttribute, kAXDescriptionAttribute, kAXTitleAttribute,
+                kAXRoleDescriptionAttribute, "AXPlaceholderValue", "AXDOMIdentifier",
+                "AXAutocompleteValue"
+            ]
+            : ["AXPlaceholderValue", "AXAutocompleteValue"]
         let descriptions = names.compactMap { attribute($0, of: element) as? String }
-        let classes = attribute("AXDOMClassList", of: element) as? [String] ?? []
+        let classes = usesFullFieldMetadata
+            ? (attribute("AXDOMClassList", of: element) as? [String] ?? [])
+            : []
         let hints = (descriptions + classes).map { String($0.prefix(512)) }
             .joined(separator: " ").lowercased()
-        guard ![
+        return ![
             "password", "passwd", "passphrase", "one-time", "verification code",
-            "credit card", "card number", "security code", "api key", "secret key",
-            "address bar", "url", "omnibox", "file name", "filename", "save as",
-            "file path"
-        ].contains(where: hints.contains)
-        else { return false }
-        return isChat || ![
-            "code editor", "source editor", "monaco", "codemirror", "ace_editor"
+            "credit card", "card number", "cc-number", "cc-csc", "security code",
+            "api key", "secret key"
         ].contains(where: hints.contains)
     }
 
-    static func hasChatInputMetadata(classes: [String]) -> Bool {
-        return classes.contains("chat-input-container") || classes.contains("chat-editor-container")
-    }
-
-    private func isChatInput(_ element: AXUIElement) -> Bool {
-        var current = element
-        for _ in 0..<16 {
-            let classes = attribute("AXDOMClassList", of: current) as? [String] ?? []
-            if Self.hasChatInputMetadata(classes: classes) { return true }
-            guard let parent = attribute(kAXParentAttribute, of: current),
-                  CFGetTypeID(parent) == AXUIElementGetTypeID()
-            else { return false }
-            current = parent as! AXUIElement
+    private func isEditable(_ element: AXUIElement, role: String) -> Bool {
+        if [kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole, "AXLayoutArea"].contains(role) {
+            return true
         }
-        return false
+        if attribute("AXEditableAncestor", of: element) != nil
+            || isSettable(kAXSelectedTextAttribute, on: element) {
+            return true
+        }
+        return ["AXWebArea", "AXDocument", kAXGroupRole].contains(role)
+            && isSettable(kAXValueAttribute, on: element)
     }
 
     private func isWebContent(_ element: AXUIElement) -> Bool {
+        if attribute("AXDOMClassList", of: element) != nil { return true }
         var current = element
-        for _ in 0..<16 {
+        for _ in 0..<64 {
             if attribute(kAXRoleAttribute, of: current) as? String == "AXWebArea" { return true }
             guard let parent = attribute(kAXParentAttribute, of: current),
                   CFGetTypeID(parent) == AXUIElementGetTypeID()
@@ -665,23 +812,6 @@ final class AccessibilityTextClient {
             current = parent as! AXUIElement
         }
         return false
-    }
-
-    private func hasTechnicalDocument(_ element: AXUIElement) -> Bool {
-        guard let value = attribute(kAXWindowAttribute, of: element),
-              CFGetTypeID(value) == AXUIElementGetTypeID(),
-              let document = attribute(kAXDocumentAttribute, of: value as! AXUIElement) as? String,
-              let url = URL(string: document)
-        else { return false }
-
-        let extensions = [
-            "swift", "py", "pyi", "js", "jsx", "ts", "tsx", "json", "yaml", "yml",
-            "toml", "ini", "conf", "cfg", "xml", "html", "css", "scss", "sh", "bash",
-            "zsh", "fish", "c", "h", "cpp", "hpp", "cs", "java", "kt", "rs", "go",
-            "rb", "php", "sql", "r", "lua", "ipynb", "svelte", "vue"
-        ]
-        return extensions.contains(url.pathExtension.lowercased())
-            || url.lastPathComponent.hasPrefix(".")
     }
 
     private func attribute(_ name: String, of element: AXUIElement) -> CFTypeRef? {
@@ -740,9 +870,11 @@ final class AccessibilityTextClient {
     }
 
     private func valueString(in range: NSRange, of element: AXUIElement) -> String? {
+        if let count = attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber,
+           !(0...16_384).contains(count.intValue) {
+            return nil
+        }
         guard range.location >= 0, range.length >= 0,
-              let count = attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber,
-              (0...16_384).contains(count.intValue),
               let text = attribute(kAXValueAttribute, of: element) as? String
         else { return nil }
         let source = text as NSString

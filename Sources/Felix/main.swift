@@ -331,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func editReplacements() {
         let alert = NSAlert()
         alert.messageText = "Personal Replacements"
-        alert.informativeText = "Use lowercase English words: typo = correction, one per line. Each side can contain one or two words. Initial capitalisation is preserved. These explicit rules override spelling and name detection, but not protected fields, technical text, or ignored words."
+        alert.informativeText = "Use lowercase English words: typo = correction, one per line. Each side can contain one or two words. Initial capitalisation is preserved. These explicit rules override spelling and name detection, but not protected fields, tokens containing numbers or symbols, or ignored words."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 220))

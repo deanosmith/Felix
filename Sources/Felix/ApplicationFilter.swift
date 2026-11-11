@@ -37,7 +37,7 @@ final class ApplicationFilter {
     }
 
     func allows(_ bundleIdentifier: String?) -> Bool {
-        guard let identifier = bundleIdentifier?.lowercased() else { return false }
+        guard let identifier = bundleIdentifier?.lowercased() else { return mode == .exclude }
         return !excludedApplications.contains(identifier)
             && (mode == .exclude || includedApplications.contains(identifier))
     }

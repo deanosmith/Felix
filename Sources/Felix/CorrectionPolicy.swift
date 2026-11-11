@@ -111,13 +111,11 @@ actor CorrectionPolicy {
         let tokenStart = prefix.lastIndex(where: { $0.isWhitespace })
             .map { prefix.index(after: $0) } ?? prefix.startIndex
         let token = String(prefix[tokenStart...])
-        let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
-        guard token == word || token == word + String(token.suffix(1)) else { return nil }
+        guard let word = trimmedWord(from: token) else { return nil }
         if let previous = prefix[..<tokenStart].split(whereSeparator: { $0.isWhitespace }).last,
            ignoredWords.contains((previous + " " + word).lowercased()) {
             return nil
         }
-        guard !looksTechnical(prefix) else { return nil }
         if let personal = personalCorrection(in: prefix, profile: profile) {
             return personal
         }
@@ -126,12 +124,10 @@ actor CorrectionPolicy {
         let minimumLength = sensitivity == .aggressive ? 2 : 3
         let hasDoubleInitialCapitals = word.count >= 3
             && word.prefix(2).allSatisfy(\.isUppercase)
-            && word.dropFirst(2).allSatisfy(\.isLowercase)
+            && word.dropFirst(2).allSatisfy({ $0.isLowercase || $0 == "'" || $0 == "\u{2019}" })
 
         guard word == "i" || (minimumLength...32).contains(word.count),
-              word.unicodeScalars.allSatisfy({
-                  (97...122).contains($0.value) || (65...90).contains($0.value)
-              }),
+              isEligibleWord(word),
               word == lowercase || word == titlecase
                 || (profile.fixesCapitals && hasDoubleInitialCapitals),
               !ignoredWords.contains(lowercase),
@@ -146,7 +142,7 @@ actor CorrectionPolicy {
         }
 
         let punctuationLength = (token as NSString).length - (word as NSString).length
-        guard punctuationLength <= 1 else { return nil }
+        guard punctuationLength <= 3 else { return nil }
 
         let tokenRange = NSRange(tokenStart..<prefix.endIndex, in: prefix)
         let range = NSRange(location: tokenRange.location, length: (word as NSString).length)
@@ -212,8 +208,7 @@ actor CorrectionPolicy {
         let tokenStart = prefix.lastIndex(where: { $0.isWhitespace })
             .map { prefix.index(after: $0) } ?? prefix.startIndex
         let token = String(prefix[tokenStart...])
-        let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
-        guard token == word || token == word + String(token.suffix(1)) else { return nil }
+        guard let word = trimmedWord(from: token) else { return nil }
 
         var start = tokenStart
         if profile.fixesSpaces, tokenStart > prefix.startIndex {
@@ -289,11 +284,39 @@ actor CorrectionPolicy {
         )
     }
 
+    private func trimmedWord(from token: String) -> String? {
+        let punctuation = CharacterSet(charactersIn: ".!?,;:\u{2026}")
+        var end = token.endIndex
+        var removed = 0
+        while end > token.startIndex, removed < 3 {
+            let previous = token.index(before: end)
+            guard token[previous].unicodeScalars.allSatisfy(punctuation.contains) else { break }
+            end = previous
+            removed += 1
+        }
+        let word = String(token[..<end])
+        return word.isEmpty ? nil : word
+    }
+
+    private func isAsciiLetter(_ scalar: UnicodeScalar) -> Bool {
+        (97...122).contains(scalar.value) || (65...90).contains(scalar.value)
+    }
+
+    private func isApostrophe(_ scalar: UnicodeScalar) -> Bool {
+        scalar.value == 39 || scalar.value == 0x2019
+    }
+
+    private func isEligibleWord(_ word: String) -> Bool {
+        let scalars = Array(word.unicodeScalars)
+        guard let first = scalars.first, let last = scalars.last,
+              isAsciiLetter(first), isAsciiLetter(last),
+              scalars.allSatisfy({ isAsciiLetter($0) || isApostrophe($0) })
+        else { return false }
+        return scalars.filter(isApostrophe).count <= 1
+    }
+
     private func isSpelledCorrectly(_ word: String) -> Bool {
-        guard word.count >= 2,
-              word.unicodeScalars.allSatisfy({
-                  (97...122).contains($0.value) || (65...90).contains($0.value)
-              })
+        guard word.count >= 2, isEligibleWord(word)
         else { return false }
         return spellChecker.checkSpelling(
             of: word.lowercased(), startingAt: 0, language: language, wrap: false,
@@ -316,33 +339,20 @@ actor CorrectionPolicy {
 
     private func normalizedReplacement(_ suggestion: String, for word: String) -> String? {
         guard (2...40).contains(suggestion.count),
-              suggestion.unicodeScalars.allSatisfy({
-                  (97...122).contains($0.value) || (65...90).contains($0.value)
-                      || $0.value == 39 || $0.value == 0x2019
-              })
+              suggestion.unicodeScalars.allSatisfy({ isAsciiLetter($0) || isApostrophe($0) })
         else { return nil }
 
         let lowercase = suggestion.lowercased()
         let titlecase = lowercase.prefix(1).uppercased() + lowercase.dropFirst()
         let startsUppercase = word.first?.isUppercase == true
-        guard lowercase != word.lowercased(),
-              suggestion == lowercase || (startsUppercase && suggestion == titlecase)
+        let isFirstPersonContraction = suggestion.hasPrefix("I'") || suggestion.hasPrefix("I\u{2019}")
+        let canonicalSuggestion = lowercase.replacingOccurrences(of: "\u{2019}", with: "'")
+        let canonicalWord = word.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
+        guard canonicalSuggestion != canonicalWord,
+              suggestion == lowercase
+                || ((startsUppercase || isFirstPersonContraction) && suggestion == titlecase)
         else { return nil }
-        return startsUppercase ? titlecase : lowercase
-    }
-
-    private func looksTechnical(_ prefix: String) -> Bool {
-        let line = prefix.components(separatedBy: .newlines).last ?? prefix
-        let markers = CharacterSet(charactersIn: "`{}[]<>=\\/_$@#|")
-        if line.rangeOfCharacter(from: markers) != nil { return true }
-        if line.contains("://") || line.contains("::") || line.contains("->") { return true }
-
-        let firstWord = line.trimmingCharacters(in: .whitespaces)
-            .split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? ""
-        return [
-            "import", "from", "func", "def", "class", "struct", "enum", "let", "var",
-            "const", "return", "export", "function", "SELECT", "INSERT", "UPDATE", "DELETE"
-        ].contains(firstWord)
+        return (startsUppercase || isFirstPersonContraction) ? titlecase : lowercase
     }
 
     private func isProperName(in text: String, range: NSRange) -> Bool {
