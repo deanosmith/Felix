@@ -112,6 +112,7 @@ actor CorrectionPolicy {
             .map { prefix.index(after: $0) } ?? prefix.startIndex
         let token = String(prefix[tokenStart...])
         let word = token.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:"))
+        guard token == word || token == word + String(token.suffix(1)) else { return nil }
         if let previous = prefix[..<tokenStart].split(whereSeparator: { $0.isWhitespace }).last,
            ignoredWords.contains((previous + " " + word).lowercased()) {
             return nil

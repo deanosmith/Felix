@@ -15,7 +15,8 @@ private let eventCallback: CGEventTapCallBack = { _, type, event, context in
     let isRepeat = isKeyEvent && event.getIntegerValueField(.keyboardEventAutorepeat) != 0
     let suppressed = MainActor.assumeIsolated {
         engine.handle(
-            type: type, keyCode: keyCode, flags: CGEventFlags(rawValue: flagBits), isRepeat: isRepeat
+            type: type, keyCode: keyCode, flags: CGEventFlags(rawValue: flagBits),
+            isRepeat: isRepeat
         )
     }
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput { return nil }
@@ -29,12 +30,13 @@ final class AutocorrectEngine: NSObject {
         let range: NSRange
         let original: String
         let replacement: String
-        let created: Date
-        var deletedTrailingCharacters = 0
+        var wasReverted = false
+        var lastForwardedCaret: Int?
     }
 
     var onChange: (() -> Void)?
     var onCorrection: ((CGRect?) -> Void)?
+    var onFeedbackReset: (() -> Void)?
     private(set) var isPaused = UserDefaults.standard.bool(forKey: "isPaused")
     private(set) var sensitivity = CorrectionSensitivity(
         rawValue: UserDefaults.standard.string(forKey: "correctionSensitivity") ?? ""
@@ -52,6 +54,7 @@ final class AutocorrectEngine: NSObject {
     private var receivedKeyboardEvent = false
     private var reportedStatus: String?
     private var tap: CFMachPort?
+    private var tappedProcessID: pid_t?
     private var source: CFRunLoopSource?
     private var permissionTimer: Timer?
     private var permissionRefresh: Task<Void, Never>?
@@ -61,6 +64,7 @@ final class AutocorrectEngine: NSObject {
     private var revision: UInt64 = 0
     private var menuIsOpen = false
     private var undoRecord: UndoRecord?
+    private var needsUndoFocusCheck = false
     private var pendingCorrection: Task<Void, Never>?
     private let maximumCorrectionAge: TimeInterval = 2
     private var spellingIsReady = false
@@ -82,8 +86,7 @@ final class AutocorrectEngine: NSObject {
     }
 
     var canUndo: Bool {
-        guard let record = undoRecord else { return false }
-        return Date().timeIntervalSince(record.created) < 10
+        undoRecord?.wasReverted == false
     }
 
     func start() {
@@ -106,6 +109,9 @@ final class AutocorrectEngine: NSObject {
     }
 
     func stop() {
+        if !client.recoverPendingSelection() {
+            correctionLog.error("Unable to restore the pending editor selection before stopping")
+        }
         isStopped = true
         revision &+= 1
         pendingCorrection?.cancel()
@@ -117,7 +123,6 @@ final class AutocorrectEngine: NSObject {
         permissionRefresh = nil
         hasAccessibilityAccess = false
         client.hasAccessibilityAccess = false
-        client.hasKeyboardInsertionAccess = false
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopTap()
     }
@@ -131,10 +136,16 @@ final class AutocorrectEngine: NSObject {
     }
 
     func togglePaused() {
+        if !isPaused, !client.recoverPendingSelection() {
+            setActivity(client.failureReason ?? "Move the caret before pausing Felix")
+            NSSound.beep()
+            return
+        }
         isPaused.toggle()
         UserDefaults.standard.set(isPaused, forKey: "isPaused")
         revision &+= 1
         undoRecord = nil
+        onFeedbackReset?()
         if !isPaused { tapIsSuspended = false }
         refreshAccess()
         onChange?()
@@ -205,44 +216,133 @@ final class AutocorrectEngine: NSObject {
     }
 
     @discardableResult
-    func undoLastCorrection() -> Bool {
+    func undoLastCorrection(atWordEnd: Bool = false) -> Bool {
         guard canUndo, let record = undoRecord else { return false }
-        var expected = record.snapshot
-        if record.deletedTrailingCharacters > 0 {
-            guard let current = client.snapshot(expectedPID: expected.processID) else {
-                setActivity(client.failureReason ?? "Correction undo skipped: focused field is unsupported")
-                return false
-            }
-            let contextOffset = expected.contextStart - current.contextStart
-            let currentText = current.text as NSString
-            let deletedRange = NSRange(
-                location: expected.caretOffset - record.deletedTrailingCharacters,
-                length: record.deletedTrailingCharacters
-            )
-            guard CFEqual(current.element, expected.element),
-                  current.selection.location
-                    == expected.selection.location - record.deletedTrailingCharacters,
-                  contextOffset >= 0, contextOffset <= currentText.length,
-                  currentText.substring(from: contextOffset)
-                    == (expected.text as NSString).replacingCharacters(in: deletedRange, with: "")
-            else {
-                setActivity("Correction undo skipped: text or focus changed")
-                return false
-            }
-            expected = current
+        pendingCorrection?.cancel()
+        let currentRevision = revision
+        pendingCorrection = Task { [weak self] in
+            await self?.revertCorrection(record, atWordEnd: atWordEnd, revision: currentRevision)
         }
-        guard client.replace(
-                range: record.range, original: record.replacement,
-                replacement: record.original, in: expected
-              ) != nil
+        return true
+    }
+
+    private func revertCorrection(_ record: UndoRecord, atWordEnd: Bool, revision: UInt64) async {
+        guard !Task.isCancelled, self.revision == revision else { return }
+        let expected = record.snapshot
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.08
+        var latest: TextSnapshot?
+        repeat {
+            latest = client.snapshot(expectedPID: expected.processID)
+            if let current = latest,
+               !atWordEnd || !CFEqual(current.element, expected.element)
+                || current.selection.location <= NSMaxRange(record.range) {
+                break
+            }
+            if IsSecureEventInputEnabled() { break }
+            do {
+                try await Task.sleep(for: .milliseconds(4))
+            } catch { return }
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        guard !Task.isCancelled, self.revision == revision else { return }
+        guard let current = latest else {
+            undoRecord = nil
+            setActivity(client.failureReason ?? "Correction undo skipped: focused field is unsupported")
+            return
+        }
+        guard CFEqual(current.element, expected.element) else {
+            undoRecord = nil
+            setActivity("Correction undo skipped: text or focus changed")
+            return
+        }
+        if atWordEnd, current.selection.location > NSMaxRange(record.range) {
+            undoRecord = nil
+            setActivity("Correction undo cancelled: editor caret changed; Backspace withheld")
+            return
+        }
+
+        let contextStart = max(expected.contextStart, current.contextStart)
+        let currentText = current.text as NSString
+        let expectedText = expected.text as NSString
+        guard current.selection.location >= NSMaxRange(record.range),
+              current.selection.location <= expected.selection.location,
+              contextStart <= record.range.location
         else {
-            setActivity(client.failureReason ?? "Correction undo skipped: text or focus changed")
-            return false
+            undoRecord = nil
+            setActivity("Correction undo skipped: text or focus changed")
+            return
         }
-        undoRecord = nil
-        revision &+= 1
+        let preservedLength = current.selection.location - contextStart
+        let currentRange = NSRange(
+            location: contextStart - current.contextStart, length: preservedLength
+        )
+        let expectedRange = NSRange(
+            location: contextStart - expected.contextStart, length: preservedLength
+        )
+        guard NSMaxRange(currentRange) <= currentText.length,
+              NSMaxRange(expectedRange) <= expectedText.length,
+              currentText.substring(with: currentRange) == expectedText.substring(with: expectedRange)
+        else {
+            undoRecord = nil
+            setActivity("Correction undo skipped: text or focus changed")
+            return
+        }
+        let result = await client.replace(
+            range: record.range, original: record.replacement,
+            replacement: record.original, in: current
+        )
+        switch result {
+        case .unchanged:
+            undoRecord = nil
+            setActivity(client.failureReason ?? "Correction undo skipped: text or focus changed")
+            return
+        case .unconfirmed:
+            undoRecord = nil
+            onFeedbackReset?()
+            setActivity(client.failureReason ?? "Correction undo was not confirmed; Backspace was withheld")
+            return
+        case let .applied(snapshot, _):
+            undoRecord = UndoRecord(
+                snapshot: snapshot,
+                range: NSRange(location: record.range.location, length: (record.original as NSString).length),
+                original: record.original, replacement: record.replacement, wasReverted: true
+            )
+        }
+        self.revision &+= 1
+        onFeedbackReset?()
         activity = "Correction reverted"
         onChange?()
+    }
+
+    private func handleBackspace() -> Bool {
+        guard let record = undoRecord else { return false }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.08
+        repeat {
+            switch client.selection(in: record.snapshot) {
+            case let .caret(location):
+                if location != record.lastForwardedCaret {
+                    if location > NSMaxRange(record.range) {
+                        undoRecord?.lastForwardedCaret = location
+                        return false
+                    }
+                    if record.wasReverted || location < NSMaxRange(record.range) {
+                        undoRecord = nil
+                        return false
+                    }
+                    // Only read full text when the verified caret reaches the corrected word.
+                    return undoLastCorrection(atWordEnd: true)
+                }
+            case .changed:
+                undoRecord = nil
+                setActivity(client.failureReason ?? "Correction undo cleared: selection changed")
+                return false
+            case .unavailable:
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.004)
+        } while ProcessInfo.processInfo.systemUptime < deadline && !IsSecureEventInputEnabled()
+
+        undoRecord = nil
+        setActivity("Correction undo unavailable: editor caret did not update; Backspace withheld")
         return true
     }
 
@@ -279,19 +379,55 @@ final class AutocorrectEngine: NSObject {
 
         guard type == .keyDown, !isPaused, !menuIsOpen, !tapIsSuspended,
               !IsSecureEventInputEnabled(), hasAccessibilityAccess
-        else { return false }
+        else {
+            if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+                needsUndoFocusCheck = true
+                onFeedbackReset?()
+            } else if type == .scrollWheel {
+                onFeedbackReset?()
+            }
+            return false
+        }
+
+        if needsUndoFocusCheck {
+            needsUndoFocusCheck = false
+            if let record = undoRecord {
+                // A click can enter a protected field without activating another app.
+                switch client.selection(in: record.snapshot) {
+                case .caret:
+                    break
+                case .changed:
+                    undoRecord = nil
+                    setActivity(client.failureReason ?? "Correction undo cleared: focused field changed")
+                case .unavailable:
+                    setActivity(client.failureReason ?? "Focused field is temporarily unavailable")
+                }
+            }
+        }
 
         let modifiers = flags.intersection([.maskCommand, .maskControl, .maskAlternate])
+        let isCaretNavigation = [
+            kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
+            kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown, kVK_Tab, kVK_Escape
+        ].contains(Int(keyCode))
+        if !isCaretNavigation, !client.recoverPendingSelection() {
+            setActivity(client.failureReason ?? "Move the caret to clear Felix's pending selection")
+            NSSound.beep()
+            return true
+        }
         let undoKey = keyCode == kVK_Delete && modifiers.isEmpty
         let undoCommand = keyCode == kVK_ANSI_Z && modifiers == .maskCommand
             && !flags.contains(.maskShift)
-        if undoKey, canUndo, let record = undoRecord,
-           record.snapshot.selection.location - record.deletedTrailingCharacters > NSMaxRange(record.range) {
-            undoRecord?.deletedTrailingCharacters += 1
-            return false
+        if undoKey { return handleBackspace() }
+        if undoCommand, undoLastCorrection() { return true }
+        if !modifiers.isEmpty
+            || isCaretNavigation || keyCode == kVK_Return || keyCode == kVK_ANSI_KeypadEnter
+            || keyCode == kVK_ForwardDelete {
+            undoRecord = nil
+            onFeedbackReset?()
+        } else {
+            undoRecord?.lastForwardedCaret = nil
         }
-        if (undoKey || undoCommand), undoLastCorrection() { return true }
-        undoRecord = nil
 
         guard keyCode == kVK_Space, modifiers.isEmpty, !isRepeat
         else { return false }
@@ -377,28 +513,52 @@ final class AutocorrectEngine: NSObject {
         let range = NSRange(
             location: snapshot.contextStart + candidate.range.location, length: candidate.range.length
         )
+        if let record = undoRecord, record.wasReverted,
+           CFEqual(snapshot.element, record.snapshot.element),
+           NSIntersectionRange(range, record.range).length > 0 {
+            let text = snapshot.text as NSString
+            let localRange = NSRange(
+                location: record.range.location - snapshot.contextStart, length: record.range.length
+            )
+            if localRange.location >= 0, NSMaxRange(localRange) <= text.length,
+               text.substring(with: localRange) == record.original {
+                let next = text.substring(from: NSMaxRange(localRange)).first
+                let extended = next.map { $0.isLetter || $0.isNumber || $0 == "_" } ?? false
+                if extended {
+                    undoRecord = nil
+                } else {
+                    setActivity("Rejected correction kept")
+                    return
+                }
+            }
+        }
         stage = "Replacing text"
-        guard let edit = client.replace(
+        let result = await client.replace(
             range: range, original: candidate.original,
             replacement: candidate.replacement, in: snapshot
-        ) else {
+        )
+        guard case let .applied(updated, bounds) = result else {
+            if case .unconfirmed = result {
+                undoRecord = nil
+                onFeedbackReset?()
+            }
             setActivity(client.failureReason ?? "Correction skipped: text or focus changed")
             return
         }
 
         correctionCount += 1
         lastCorrection = candidate
-        activity = edit.bounds == nil ? "Correction applied; word bounds unavailable" : "Correction applied"
+        activity = bounds == nil ? "Correction applied; word bounds unavailable" : "Correction applied"
         correctionLog.notice("Correction applied")
-        if edit.bounds == nil {
+        if bounds == nil {
             correctionLog.notice("Word glow unavailable: editor did not expose text bounds")
         }
         undoRecord = UndoRecord(
-            snapshot: edit.snapshot,
+            snapshot: updated,
             range: NSRange(location: range.location, length: (candidate.replacement as NSString).length),
-            original: candidate.original, replacement: candidate.replacement, created: Date()
+            original: candidate.original, replacement: candidate.replacement
         )
-        onCorrection?(edit.bounds)
+        onCorrection?(bounds)
         onChange?()
     }
 
@@ -432,45 +592,48 @@ final class AutocorrectEngine: NSObject {
                     )
                 }
                 if promptKeyboard { _ = CGRequestListenEventAccess() }
-                let trusted = AXIsProcessTrusted()
-                return (trusted: trusted, canInsert: trusted && CGPreflightPostEventAccess())
+                return AXIsProcessTrusted()
             }.value
             guard let self, !Task.isCancelled, !isStopped else { return }
             permissionRefresh = nil
-            applyAccess(trusted: access.trusted, canInsert: access.canInsert)
+            applyAccess(trusted: access)
         }
     }
 
-    private func applyAccess(trusted: Bool, canInsert: Bool) {
+    private func applyAccess(trusted: Bool) {
         if trusted && !hasAccessibilityAccess { tapIsSuspended = false }
         hasAccessibilityAccess = trusted
         client.hasAccessibilityAccess = trusted
-        client.hasKeyboardInsertionAccess = canInsert
-        if !canUndo { undoRecord = nil }
         if isPaused || !trusted || tapIsSuspended {
             revision &+= 1
             pendingCorrection?.cancel()
             pendingCorrection = nil
             undoRecord = nil
             stopTap()
-        } else if tap == nil {
-            let types: [CGEventType] = [
-                .keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown, .otherMouseDown
-            ]
-            let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
-            if let newTap = CGEvent.tapCreate(
-                tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .defaultTap,
-                eventsOfInterest: mask, callback: eventCallback,
-                userInfo: Unmanaged.passUnretained(self).toOpaque()
-            ), let newSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0) {
-                tap = newTap
-                source = newSource
-                CFRunLoopAddSource(CFRunLoopGetMain(), newSource, .commonModes)
-                CGEvent.tapEnable(tap: newTap, enable: true)
-            } else {
-                tapIsSuspended = true
-                correctionLog.error("Keyboard monitoring stopped because the input tap could not be created")
+        } else if let application = NSWorkspace.shared.frontmostApplication, client.allows(application) {
+            if tappedProcessID != application.processIdentifier { stopTap() }
+            if tap == nil {
+                let types: [CGEventType] = [
+                    .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel
+                ]
+                let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+                if let newTap = CGEvent.tapCreateForPid(
+                    pid: application.processIdentifier, place: .tailAppendEventTap, options: .defaultTap,
+                    eventsOfInterest: mask, callback: eventCallback,
+                    userInfo: Unmanaged.passUnretained(self).toOpaque()
+                ), let newSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0) {
+                    tap = newTap
+                    tappedProcessID = application.processIdentifier
+                    source = newSource
+                    CFRunLoopAddSource(CFRunLoopGetMain(), newSource, .commonModes)
+                    CGEvent.tapEnable(tap: newTap, enable: true)
+                } else {
+                    tapIsSuspended = true
+                    correctionLog.error("Keyboard monitoring stopped because the input tap could not be created")
+                }
             }
+        } else {
+            stopTap()
         }
         if let application = NSWorkspace.shared.frontmostApplication, client.allows(application) {
             client.prepare(application)
@@ -491,6 +654,7 @@ final class AutocorrectEngine: NSObject {
         }
         source = nil
         tap = nil
+        tappedProcessID = nil
     }
 
     private func isKeyboardLayout() -> Bool {
@@ -503,9 +667,11 @@ final class AutocorrectEngine: NSObject {
     @objc private func applicationChanged(_ notification: Notification) {
         revision &+= 1
         undoRecord = nil
+        onFeedbackReset?()
         if let application = NSWorkspace.shared.frontmostApplication, client.allows(application) {
             client.prepare(application)
         }
+        refreshAccess()
         onChange?()
     }
 }

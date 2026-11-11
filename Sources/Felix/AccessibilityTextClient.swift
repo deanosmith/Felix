@@ -16,29 +16,37 @@ struct TextSnapshot {
     var caretOffset: Int { selection.location - contextStart }
 }
 
-@MainActor
-enum TextReplacementTransaction {
-    static func apply(
-        insert: () -> Bool,
-        verifyInsertion: () -> Bool,
-        removeOriginal: () -> Bool,
-        verifyReplacement: () -> Bool
-    ) -> Bool {
-        guard insert(), verifyInsertion() else { return false }
-        guard removeOriginal() else { return false }
-        return verifyReplacement()
-    }
+enum TextReplacementResult {
+    case unchanged
+    case unconfirmed
+    case applied(snapshot: TextSnapshot, bounds: CGRect?)
+}
+
+enum TextSelectionResult {
+    case caret(Int)
+    case changed
+    case unavailable
 }
 
 @MainActor
 final class AccessibilityTextClient {
+    private struct PendingSelection {
+        let snapshot: TextSnapshot
+        let originalRange: NSRange
+        let replacementRange: NSRange
+        let replacementContext: String
+        let caret: Int
+        var writeWasSubmitted = false
+    }
+
     private let systemWide = AXUIElementCreateSystemWide()
     private let applicationFilter: ApplicationFilter
     private let accessibilityLog = Logger(subsystem: "local.deanmsmith.Felix", category: "Accessibility")
     private var accessibilityRequests: [pid_t: TimeInterval] = [:]
+    private var pendingSelections: [PendingSelection] = []
+    private var replacementIsInFlight = false
     private(set) var failureReason: String?
     var hasAccessibilityAccess = false
-    var hasKeyboardInsertionAccess = false
 
     init(applicationFilter: ApplicationFilter) {
         self.applicationFilter = applicationFilter
@@ -68,6 +76,7 @@ final class AccessibilityTextClient {
     }
 
     func snapshot(expectedPID: pid_t) -> TextSnapshot? {
+        guard recoverPendingSelection() else { return nil }
         failureReason = "Focused app is unavailable or protected"
         guard let application = NSWorkspace.shared.frontmostApplication,
               application.processIdentifier == expectedPID, allows(application)
@@ -85,17 +94,16 @@ final class AccessibilityTextClient {
             failureReason = "VS Code chat needs Editor: Accessibility Support set to On"
             return nil
         }
+        failureReason = "Focused field does not expose a collapsed caret"
+        guard let selection = selectedRange(of: element),
+              selection.location >= 0, selection.length == 0
+        else { return nil }
         let isWebEditor = isChromium(application) || isWebContent(element)
         let selectionMarkers = isWebEditor ? selectedTextMarkers(of: element) : nil
-        failureReason = isWebEditor
-            ? "Focused web field does not expose a writable text-marker caret"
-            : "Focused field does not expose an editable caret"
-        guard
-              isWebEditor
-                ? selectionMarkers != nil && isSettable("AXSelectedTextMarkerRange", on: element)
-                : isSettable(kAXSelectedTextRangeAttribute, on: element),
-              let selection = selectedRange(of: element),
-              selection.location >= 0, selection.length == 0
+        failureReason = "Focused field does not expose a writable caret"
+        guard isWebEditor
+            ? selectionMarkers != nil && isSettable("AXSelectedTextMarkerRange", on: element)
+            : isSettable(kAXSelectedTextRangeAttribute, on: element)
         else { return nil }
 
         let characterCount = (attribute(kAXNumberOfCharactersAttribute, of: element) as? NSNumber)?
@@ -111,6 +119,10 @@ final class AccessibilityTextClient {
         guard let text = string(in: contextRange, of: element)
             ?? string(in: prefixRange, of: element)
         else { return nil }
+        guard selectedRange(of: element) == selection else {
+            failureReason = "Editor changed its caret while reading text"
+            return nil
+        }
 
         failureReason = nil
         return TextSnapshot(
@@ -123,100 +135,322 @@ final class AccessibilityTextClient {
         )
     }
 
+    func recoverPendingSelection() -> Bool {
+        guard !pendingSelections.isEmpty else { return true }
+        pendingSelections.removeAll {
+            NSRunningApplication(processIdentifier: $0.snapshot.processID)?.isTerminated != false
+        }
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              pendingSelections.contains(where: { $0.snapshot.processID == application.processIdentifier })
+        else { return true }
+        failureReason = "Felix could not restore its selection; move the caret before typing"
+        guard let focused = focusedElement(expectedPID: application.processIdentifier)
+        else { return false }
+        guard let index = pendingSelections.firstIndex(where: { CFEqual($0.snapshot.element, focused) })
+        else { return true }
+        let pending = pendingSelections[index]
+        guard let current = selectedRange(of: focused) else { return false }
+        if !pending.writeWasSubmitted {
+            guard current == pending.originalRange || current == pending.snapshot.selection else {
+                pendingSelections.remove(at: index)
+                failureReason = nil
+                return true
+            }
+            guard string(
+                in: NSRange(
+                    location: pending.snapshot.contextStart,
+                    length: (pending.snapshot.text as NSString).length
+                ), of: focused
+            ) == pending.snapshot.text,
+                  setSelection(
+                    pending.snapshot.selection, markers: pending.snapshot.selectionMarkers, on: focused
+                  ),
+                  selectedRange(of: focused) == pending.snapshot.selection
+            else { return false }
+            pendingSelections.remove(at: index)
+            failureReason = nil
+            return true
+        }
+        let replacementIsVisible = pending.writeWasSubmitted && string(
+            in: NSRange(
+                location: pending.snapshot.contextStart,
+                length: (pending.replacementContext as NSString).length
+            ), of: focused
+        ) == pending.replacementContext
+        if !replacementIsVisible, current == pending.snapshot.selection,
+           string(
+            in: NSRange(
+                location: pending.snapshot.contextStart, length: (pending.snapshot.text as NSString).length
+            ), of: focused
+           ) == pending.snapshot.text {
+            return false
+        }
+        let needsCaretUpdate = current.length == 0 && replacementIsVisible
+            && current.location != pending.caret
+            && (current.location == pending.snapshot.selection.location
+                || current.location == pending.originalRange.location)
+        guard needsCaretUpdate || (current.length > 0
+              && (current == pending.originalRange || current == pending.replacementRange))
+        else {
+            pendingSelections.remove(at: index)
+            failureReason = nil
+            return true
+        }
+
+        let location: Int
+        if pending.writeWasSubmitted {
+            guard replacementIsVisible else { return false }
+            location = pending.caret
+        } else {
+            location = NSMaxRange(current)
+        }
+        let markers: AXTextMarkerRange?
+        if pending.snapshot.selectionMarkers != nil {
+            guard let selected = selectedTextMarkers(of: focused),
+                  let caret = marker(
+                    from: AXTextMarkerRangeCopyEndMarker(selected),
+                    offset: location - NSMaxRange(current), of: focused
+                  )
+            else { return false }
+            markers = AXTextMarkerRangeCreate(nil, caret, caret)
+        } else {
+            markers = nil
+        }
+        let collapsed = NSRange(location: location, length: 0)
+        guard setSelection(collapsed, markers: markers, on: focused),
+              selectedRange(of: focused) == collapsed
+        else { return false }
+        pendingSelections.remove(at: index)
+        failureReason = nil
+        return true
+    }
+
+    func selection(in expected: TextSnapshot) -> TextSelectionResult {
+        failureReason = "Correction focus changed"
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              application.processIdentifier == expected.processID, allows(application)
+        else { return .changed }
+        failureReason = "Editor caret is temporarily unavailable"
+        guard let focused = focusedElement(expectedPID: expected.processID) else { return .unavailable }
+        guard CFEqual(focused, expected.element) else {
+            failureReason = "Correction focus changed"
+            return .changed
+        }
+        guard let range = selectedRange(of: focused) else { return .unavailable }
+        guard range.location >= 0, range.length == 0 else {
+            failureReason = "Correction selection changed"
+            return .changed
+        }
+        failureReason = nil
+        return .caret(range.location)
+    }
+
     func replace(
         range: NSRange,
         original: String,
         replacement: String,
         in expected: TextSnapshot
-    ) -> (snapshot: TextSnapshot, bounds: CGRect?)? {
-        guard let current = snapshot(expectedPID: expected.processID) else { return nil }
-        failureReason = "Text or focus changed before correction"
-        guard
-              CFEqual(current.element, expected.element),
-              current.selection == expected.selection,
-              current.contextStart == expected.contextStart, current.text == expected.text,
-              string(in: range, of: current.element) == original,
-              range.location >= 0, range.length <= current.selection.location - range.location
-        else { return nil }
+    ) async -> TextReplacementResult {
+        guard !replacementIsInFlight else {
+            failureReason = "Previous replacement is still being confirmed"
+            return .unchanged
+        }
+        replacementIsInFlight = true
+        defer { replacementIsInFlight = false }
+        guard recoverPendingSelection() else { return .unchanged }
+        failureReason = "Correction range is outside the verified text"
+        let context = expected.text as NSString
+        let localRange = NSRange(
+            location: range.location - expected.contextStart, length: range.length
+        )
+        guard localRange.location >= 0, range.length >= 0,
+              NSMaxRange(localRange) <= context.length,
+              NSMaxRange(range) <= expected.selection.location,
+              expected.caretOffset <= context.length,
+              context.substring(with: localRange) == original
+        else { return .unchanged }
 
         let suffixRange = NSRange(
-            location: NSMaxRange(range), length: current.selection.location - NSMaxRange(range)
+            location: NSMaxRange(localRange), length: expected.selection.location - NSMaxRange(range)
         )
-        guard suffixRange.length <= 4,
-              let suffix = string(in: suffixRange, of: current.element),
-              suffix.unicodeScalars.allSatisfy({
+        guard suffixRange.length <= 4 else { return .unchanged }
+        let suffix = context.substring(with: suffixRange)
+        guard suffix.unicodeScalars.allSatisfy({
                   CharacterSet.whitespaces.contains($0)
                       || CharacterSet(charactersIn: ".!?,;:").contains($0)
               })
-        else { return nil }
+        else { return .unchanged }
 
         let editRange = NSRange(location: range.location, length: range.length + suffixRange.length)
         let originalText = original + suffix
         let replacementText = replacement + suffix
-        let context = current.text as NSString
-        let localRange = NSRange(
-            location: editRange.location - current.contextStart, length: editRange.length
+        let replacementContext = context.replacingCharacters(
+            in: NSRange(location: localRange.location, length: editRange.length), with: replacementText
         )
-        guard localRange.location >= 0, NSMaxRange(localRange) <= context.length else { return nil }
-        let insertedContext = context.replacingCharacters(
-            in: NSRange(location: localRange.location, length: 0), with: replacementText
-        )
-        let replacementContext = context.replacingCharacters(in: localRange, with: replacementText)
         let caretLocation = range.location + (replacementText as NSString).length
         failureReason = "Focused app is unavailable"
-        guard let application = NSRunningApplication(processIdentifier: expected.processID)
-        else { return nil }
-        failureReason = "Keyboard insertion permission needed"
-        guard hasKeyboardInsertionAccess else { return nil }
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              application.processIdentifier == expected.processID, allows(application)
+        else { return .unchanged }
 
-        guard let focused = focusedElement(expectedPID: expected.processID),
-              CFEqual(focused, current.element), isSafe(focused, in: application),
-              selectedRange(of: focused) == current.selection,
-              string(in: editRange, of: focused) == originalText
-        else { return nil }
+        failureReason = "Text or focus changed before correction"
+        guard !IsSecureEventInputEnabled(),
+              let focused = focusedElement(expectedPID: expected.processID),
+              CFEqual(focused, expected.element), isSafe(focused, in: application)
+        else { return .unchanged }
 
-        failureReason = "Editor did not confirm the correction caret"
-        guard setCaret(at: range.location, in: current), waitUntil({
-            self.matches(current, text: current.text, caret: range.location)
-        }) else {
-            restoreCaret(afterFailureIn: current, at: range.location)
-            return nil
+        let markers: AXTextMarkerRange?
+        if expected.selectionMarkers != nil {
+            failureReason = "Editor did not expose an exact replacement range"
+            guard let caretMarkers = selectedTextMarkers(of: focused),
+                  let start = marker(
+                    before: AXTextMarkerRangeCopyEndMarker(caretMarkers),
+                    count: editRange.length, of: focused
+                  )
+            else { return .unchanged }
+            let range = AXTextMarkerRangeCreate(nil, start, AXTextMarkerRangeCopyEndMarker(caretMarkers))
+            guard (parameterizedAttribute(
+                "AXStringForTextMarkerRange", value: range, of: focused
+            ) as? String) == originalText
+            else { return .unchanged }
+            markers = range
+        } else {
+            markers = nil
         }
+        let usesAtomicOperation = markers != nil
+            && supportsAtomicReplacement(on: focused, in: application)
+        let usesSelectedText = markers == nil && isSettable(kAXSelectedTextAttribute, on: focused)
+        let insertion = usesAtomicOperation || usesSelectedText ? nil : keyboardInsertion(replacementText)
+        guard usesAtomicOperation || usesSelectedText || insertion != nil else { return .unchanged }
 
-        failureReason = "Editor did not confirm inserted text; original text was kept"
-        guard TextReplacementTransaction.apply(
-            insert: {
-                self.insertUsingKeyboard(replacementText, processID: expected.processID)
-            },
-            verifyInsertion: {
-                self.waitUntil {
-                    self.matches(current, text: insertedContext, caret: caretLocation)
-                }
-            },
-            removeOriginal: {
-                guard self.matches(current, text: insertedContext, caret: caretLocation)
-                else { return false }
-                self.failureReason = "Editor did not confirm removal; replacement text was kept"
-                return self.removeUsingKeyboard(originalText.count, processID: expected.processID)
-            },
-            verifyReplacement: {
-                self.waitUntil {
-                    self.matches(current, text: replacementContext, caret: caretLocation)
-                }
+        failureReason = "Text or focus changed before correction"
+        guard !IsSecureEventInputEnabled(),
+              let verified = focusedElement(expectedPID: expected.processID),
+              CFEqual(verified, focused), selectedRange(of: verified) == expected.selection,
+              string(
+                in: NSRange(location: expected.contextStart, length: context.length), of: verified
+              ) == expected.text
+        else { return .unchanged }
+
+        failureReason = "Editor did not confirm replacement; no additional edit was attempted"
+        if usesAtomicOperation, let markers {
+            let operation: [String: Any] = [
+                "AXTextOperationType": "TextOperationReplacePreserveCase",
+                "AXTextOperationMarkerRanges": [markers],
+                "AXTextOperationReplacementString": replacementText,
+                "AXTextOperationSmartReplace": false
+            ]
+            var result: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(
+                focused, "AXTextOperation" as CFString, operation as CFDictionary, &result
+            ) == .success else { return .unconfirmed }
+        } else {
+            pendingSelections.append(PendingSelection(
+                snapshot: expected, originalRange: editRange,
+                replacementRange: NSRange(
+                    location: editRange.location, length: (replacementText as NSString).length
+                ), replacementContext: replacementContext, caret: caretLocation
+            ))
+            guard setSelection(editRange, markers: markers, on: focused),
+                  await waitUntil({ self.selectedRange(of: focused) == editRange })
+            else {
+                let reported = selectedRange(of: focused)
+                    .map { "\($0.location):\($0.length)" } ?? "unavailable"
+                let selectedLength = (attribute(kAXSelectedTextAttribute, of: focused) as? String)
+                    .map { ($0 as NSString).length.description } ?? "unavailable"
+                _ = recoverPendingSelection()
+                failureReason = "Editor selection not confirmed: requested \(editRange.location):\(editRange.length), reported \(reported), selected length \(selectedLength)"
+                return .unconfirmed
             }
-        ) else {
-            restoreCaret(afterFailureIn: current, at: range.location)
-            return nil
+            guard !Task.isCancelled, !IsSecureEventInputEnabled(),
+                  let target = focusedElement(expectedPID: expected.processID),
+                  CFEqual(target, focused), selectedRange(of: target) == editRange,
+                  string(in: editRange, of: target) == originalText
+            else {
+                _ = recoverPendingSelection()
+                return .unconfirmed
+            }
+            if let index = pendingSelections.firstIndex(where: { CFEqual($0.snapshot.element, focused) }) {
+                pendingSelections[index].writeWasSubmitted = true
+            }
+            if usesSelectedText {
+                let result = AXUIElementSetAttributeValue(
+                    focused, kAXSelectedTextAttribute as CFString, replacementText as CFString
+                )
+                guard result == .success else {
+                    if [.attributeUnsupported, .notImplemented].contains(result),
+                       let index = pendingSelections.firstIndex(where: { CFEqual($0.snapshot.element, focused) }) {
+                        pendingSelections[index].writeWasSubmitted = false
+                    }
+                    _ = recoverPendingSelection()
+                    return .unconfirmed
+                }
+            } else if let insertion {
+                insertion.0.postToPid(expected.processID)
+                insertion.1.postToPid(expected.processID)
+            }
+        }
+        guard await waitUntil({
+            self.recoverPendingSelection()
+                && self.matches(expected, text: replacementContext, caret: caretLocation)
+        }) else {
+            failureReason = "Editor did not confirm replacement text and caret"
+            return .unconfirmed
         }
 
         let replacementLength = (replacement as NSString).length
         let replacementRange = NSRange(location: range.location, length: replacementLength)
-        guard let updated = snapshot(expectedPID: expected.processID) else { return nil }
+        let updatedMarkers = expected.selectionMarkers == nil ? nil : selectedTextMarkers(of: focused)
+        guard (expected.selectionMarkers == nil || updatedMarkers != nil),
+              matches(expected, text: replacementContext, caret: caretLocation)
+        else { return .unconfirmed }
+        let updated = TextSnapshot(
+            element: focused, processID: expected.processID,
+            selection: NSRange(location: caretLocation, length: 0), selectionMarkers: updatedMarkers,
+            contextStart: expected.contextStart, text: replacementContext
+        )
 
-        return (
+        failureReason = nil
+        return .applied(
             snapshot: updated,
             bounds: bounds(of: replacementRange, in: updated)
         )
+    }
+
+    private func setSelection(
+        _ range: NSRange, markers: AXTextMarkerRange?, on element: AXUIElement
+    ) -> Bool {
+        if let markers {
+            return AXUIElementSetAttributeValue(
+                element, "AXSelectedTextMarkerRange" as CFString, markers
+            ) == .success
+        }
+        var requested = CFRange(location: range.location, length: range.length)
+        guard let value = AXValueCreate(.cfRange, &requested) else { return false }
+        return AXUIElementSetAttributeValue(
+            element, kAXSelectedTextRangeAttribute as CFString, value
+        ) == .success
+    }
+
+    private func keyboardInsertion(_ text: String) -> (CGEvent, CGEvent)? {
+        failureReason = "Keyboard insertion permission is unavailable"
+        guard CGPreflightPostEventAccess(), let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+        else { return nil }
+        let characters = Array(text.utf16)
+        return characters.withUnsafeBufferPointer { buffer in
+            guard let pointer = buffer.baseAddress else {
+                failureReason = "Replacement text is empty"
+                return nil
+            }
+            for event in [down, up] {
+                event.flags = []
+                event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
+                event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: pointer)
+            }
+            return (down, up)
+        }
     }
 
     private func matches(_ snapshot: TextSnapshot, text: String, caret: Int) -> Bool {
@@ -230,31 +464,16 @@ final class AccessibilityTextClient {
         ) == text
     }
 
-    private func setCaret(at location: Int, in snapshot: TextSnapshot) -> Bool {
-        guard location >= 0, location <= snapshot.selection.location,
-              let focused = focusedElement(expectedPID: snapshot.processID),
-              CFEqual(focused, snapshot.element)
-        else { return false }
-        if let markers = snapshot.selectionMarkers {
-            guard let caret = marker(
-                before: AXTextMarkerRangeCopyEndMarker(markers),
-                count: snapshot.selection.location - location, of: focused
-            ) else { return false }
-            let selection = AXTextMarkerRangeCreate(nil, caret, caret)
-            return AXUIElementSetAttributeValue(
-                focused, "AXSelectedTextMarkerRange" as CFString, selection
-            ) == .success
+    private func supportsAtomicReplacement(
+        on element: AXUIElement, in application: NSRunningApplication
+    ) -> Bool {
+        // Older WebKit can interpret an unknown replacement operation as selection.
+        if !isChromium(application) {
+            guard #available(macOS 15.2, *) else { return false }
         }
-        var range = CFRange(location: location, length: 0)
-        guard let selection = AXValueCreate(.cfRange, &range) else { return false }
-        return AXUIElementSetAttributeValue(
-            focused, kAXSelectedTextRangeAttribute as CFString, selection
-        ) == .success
-    }
-
-    private func restoreCaret(afterFailureIn snapshot: TextSnapshot, at location: Int) {
-        guard matches(snapshot, text: snapshot.text, caret: location) else { return }
-        _ = setCaret(at: snapshot.selection.location, in: snapshot)
+        var attributes: CFArray?
+        return AXUIElementCopyParameterizedAttributeNames(element, &attributes) == .success
+            && (attributes as? [String] ?? []).contains("AXTextOperation")
     }
 
     private func bounds(of range: NSRange, in snapshot: TextSnapshot) -> CGRect? {
@@ -290,10 +509,20 @@ final class AccessibilityTextClient {
     }
 
     private func marker(before marker: AXTextMarker, count: Int, of element: AXUIElement) -> AXTextMarker? {
+        self.marker(from: marker, offset: -count, of: element)
+    }
+
+    private func marker(from marker: AXTextMarker, offset: Int, of element: AXUIElement) -> AXTextMarker? {
         var current = marker
-        for _ in 0..<count {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.08
+        let attribute = offset < 0 ? "AXPreviousTextMarkerForTextMarker" : "AXNextTextMarkerForTextMarker"
+        for _ in 0..<abs(offset) {
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                failureReason = "Editor did not provide the text-marker range promptly"
+                return nil
+            }
             guard let previous = parameterizedAttribute(
-                "AXPreviousTextMarkerForTextMarker", value: current, of: element
+                attribute, value: current, of: element
             ), CFGetTypeID(previous) == AXTextMarkerGetTypeID()
             else { return nil }
             current = previous as! AXTextMarker
@@ -344,57 +573,16 @@ final class AccessibilityTextClient {
         ].contains(where: identifier.hasPrefix)
     }
 
-    private func waitUntil(_ condition: () -> Bool) -> Bool {
+    private func waitUntil(_ condition: () -> Bool) async -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + 0.08
         repeat {
-            guard !IsSecureEventInputEnabled() else { return false }
+            guard !Task.isCancelled, !IsSecureEventInputEnabled() else { return false }
             if condition() { return true }
-            Thread.sleep(forTimeInterval: 0.004)
+            do {
+                try await Task.sleep(for: .milliseconds(4))
+            } catch { return false }
         } while ProcessInfo.processInfo.systemUptime < deadline
         return false
-    }
-
-    private func insertUsingKeyboard(_ text: String, processID: pid_t) -> Bool {
-        guard !IsSecureEventInputEnabled(), hasKeyboardInsertionAccess,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
-              let source = CGEventSource(stateID: .privateState),
-              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
-        else { return false }
-
-        let characters = Array(text.utf16)
-        return characters.withUnsafeBufferPointer { buffer in
-            guard let pointer = buffer.baseAddress else { return false }
-            for event in [keyDown, keyUp] {
-                event.flags = []
-                event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
-                event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: pointer)
-                event.postToPid(processID)
-            }
-            return true
-        }
-    }
-
-    private func removeUsingKeyboard(_ count: Int, processID: pid_t) -> Bool {
-        guard count > 0, !IsSecureEventInputEnabled(), hasKeyboardInsertionAccess,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
-              let source = CGEventSource(stateID: .privateState),
-              let keyDown = CGEvent(
-                  keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ForwardDelete), keyDown: true
-              ),
-              let keyUp = CGEvent(
-                  keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ForwardDelete), keyDown: false
-              )
-        else { return false }
-        for event in [keyDown, keyUp] {
-            event.flags = []
-            event.setIntegerValueField(.eventSourceUserData, value: felixSyntheticEventTag)
-        }
-        for _ in 0..<count {
-            keyDown.postToPid(processID)
-            keyUp.postToPid(processID)
-        }
-        return true
     }
 
     private func focusedElement(expectedPID: pid_t) -> AXUIElement? {
@@ -512,12 +700,6 @@ final class AccessibilityTextClient {
         return result
     }
 
-    private func isSettable(_ name: String, on element: AXUIElement) -> Bool {
-        var settable = DarwinBoolean(false)
-        return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
-            && settable.boolValue
-    }
-
     private func selectedRange(of element: AXUIElement) -> NSRange? {
         guard let value = attribute(kAXSelectedTextRangeAttribute, of: element),
               CFGetTypeID(value) == AXValueGetTypeID()
@@ -525,6 +707,12 @@ final class AccessibilityTextClient {
         var range = CFRange(location: 0, length: 0)
         guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    private func isSettable(_ name: String, on element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
+            && settable.boolValue
     }
 
     private func selectedTextMarkers(of element: AXUIElement) -> AXTextMarkerRange? {

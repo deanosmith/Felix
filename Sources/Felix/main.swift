@@ -116,17 +116,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         engine.onChange = { [weak self] in self?.updateMenu() }
         engine.onCorrection = { [weak self] rectangle in self?.showCorrection(at: rectangle) }
+        engine.onFeedbackReset = { [weak self] in self?.clearCorrectionFeedback() }
         engine.start()
         engine.requestAccessibilityPermission()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        clearCorrectionFeedback()
+        engine.stop()
+    }
+
+    private func clearCorrectionFeedback() {
         for feedback in correctionFeedback.values {
             feedback.task.cancel()
             feedback.panel?.orderOut(nil)
         }
         correctionFeedback.removeAll()
-        engine.stop()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
